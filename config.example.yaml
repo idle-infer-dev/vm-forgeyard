@@ -1,0 +1,159 @@
+host:
+  vm_cpu_set: [0, 1, 2, 3]
+  max_vms: 16
+  max_total_vcpus: 24
+  max_total_memory_mb: 32768
+  max_layer3_per_layer2: 6
+network:
+  cidr: 10.80.0.0/20
+  gateway: 10.80.0.1
+  dhcp_cidr: 10.81.0.0/24
+  mac_prefix: "52:54:00"
+  segments:
+    - id: dev
+      bridge: dev
+      address: 10.80.1.1/24
+      dhcp_range_start: 10.80.1.100
+      dhcp_range_end: 10.80.1.199
+    - id: stage
+      bridge: stage
+      address: 10.80.2.1/24
+      dhcp_range_start: 10.80.2.100
+      dhcp_range_end: 10.80.2.199
+    - id: misc
+      bridge: misc
+      address: 10.80.3.1/24
+      dhcp_range_start: 10.80.3.100
+      dhcp_range_end: 10.80.3.199
+    - id: live
+      bridge: live
+      address: 10.80.4.1/24
+      dhcp_range_start: 10.80.4.100
+      dhcp_range_end: 10.80.4.199
+firewall:
+  default_ingress_sources:
+    - 10.0.0.0/8
+leases:
+  namespace_lock_ttl_seconds: 7200
+guest_bootstrap:
+  # Optional HTTP proxy injected into guest apt configuration.
+  apt_http_proxy:
+image_factory:
+  authorized_keys_path: /root/.ssh/authorized_keys
+  recipes:
+    - id: ubuntu-24.04-noble-amd64
+      distro: Ubuntu
+      version: "24.04 LTS"
+      suite: noble
+      architecture: amd64
+      method: debootstrap
+      package_manager: apt
+      repository_urls:
+        - http://archive.ubuntu.com/ubuntu/
+      boot_mode: direct_kernel
+      disk_layout: filesystem
+      filesystem: ext4
+      output_format: raw
+      catalog_image_id: ubuntu-24.04-noble-amd64
+      required_role: admin
+      notes: Pinned Ubuntu 24.04 LTS default recipe; builder implementation is pending.
+    - id: devuan-6-excalibur-amd64
+      distro: Devuan
+      version: "6"
+      suite: excalibur
+      architecture: amd64
+      method: debootstrap
+      package_manager: apt
+      repository_urls:
+        - http://deb.devuan.org/merged/
+      boot_mode: direct_kernel
+      disk_layout: filesystem
+      filesystem: ext4
+      output_format: raw
+      catalog_image_id: devuan-6-excalibur-amd64
+      required_role: admin
+      notes: Pinned Devuan Excalibur default recipe; builder implementation is pending.
+    - id: openbsd-7.9-amd64
+      distro: OpenBSD
+      version: "7.9"
+      architecture: amd64
+      method: installer
+      package_manager: pkg_add
+      repository_urls:
+        - https://cdn.openbsd.org/pub/OpenBSD/7.9/
+      boot_mode: grub
+      disk_layout: gpt-root-last
+      filesystem:
+      output_format: raw
+      catalog_image_id: openbsd-7.9-amd64
+      required_role: admin
+      notes: Pinned OpenBSD release recipe; installer/import implementation is pending.
+storage:
+  # Keep these directories on durable local storage for disk-backed hosts.
+  # They should normally live under one filesystem so move-based lifecycle
+  # operations stay cheap.
+  base_dir: ./var/lib/kvm-control/base
+  layer2_dir: ./var/lib/kvm-control/layer2
+  layer3_dir: ./var/lib/kvm-control/layer3
+  image_remote_dir: ./var/lib/kvm-control/image-remote
+  image_remote_backend: local
+  image_remote_rsync_host:
+  image_remote_rsync_module:
+  image_remote_rsync_subdir: kvm-control-images
+  image_remote_rsync_timeout_s: 30
+  trash_dir: ./var/lib/kvm-control/trash
+  webroot_dir: ./var/lib/kvm-control/webroot
+  state_dir: ./var/lib/kvm-control/state
+  requests_dir: ./run/kvm-control/requests
+  runtime_dir: ./run/kvm-control/runtime
+  audit_log: ./var/lib/kvm-control/state/audit.log
+auth:
+  # Bootstrap only the admin token here; onboard dev/repository tokens with:
+  # POST /v1/admin/auth/tokens {"username": "dev"}
+  # POST /v1/admin/auth/tokens {"username": "git.repo-name"}
+  admin_token:
+  admin_token_hash:
+  trusted_proxy_cidrs: []
+  acl:
+    - users: ["admin"]
+      source_cidrs: []
+      zones: ["dev", "stage", "misc", "live"]
+    - users: ["dev"]
+      source_cidrs: []
+      zones: ["dev"]
+    - users: ["staging"]
+      source_cidrs: []
+      zones: ["stage"]
+    - users: ["live"]
+      source_cidrs: []
+      zones: ["live"]
+    - users: ["git.*"]
+      source_cidrs: []
+      zones: ["dev"]
+executor_bin: "python3 -m kvm_control.root_vm_exec"
+dry_run: false
+templates:
+  - id: devuan-daedalus
+    base_image: devuan-daedalus-amd64.raw
+    base_image_format: raw
+    architecture: x86_64
+    boot_mode: direct_kernel
+    kernel_path: /var/lib/kvm-control/kernels/daedalus/vmlinuz
+    initrd_path: /var/lib/kvm-control/kernels/daedalus/initrd.img
+    kernel_append: root=/dev/vda rw console=ttyS0 ip=dhcp
+    max_vcpus: 8
+    max_memory_mb: 8192
+    default_vcpus: 2
+    default_memory_mb: 2048
+  - id: devuan-excalibur
+    base_image: devuan-excalibur-amd64.raw
+    base_image_format: raw
+    architecture: x86_64
+    boot_mode: direct_kernel
+    kernel_path: /var/lib/kvm-control/kernels/excalibur/vmlinuz
+    initrd_path: /var/lib/kvm-control/kernels/excalibur/initrd.img
+    kernel_append: root=/dev/vda rw console=ttyS0 ip=dhcp
+    max_vcpus: 8
+    max_memory_mb: 8192
+    default_vcpus: 2
+    default_memory_mb: 2048

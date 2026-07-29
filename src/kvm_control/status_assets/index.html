@@ -1,0 +1,52 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>kvm-control status</title>
+  <link rel="stylesheet" href="/status/assets/style.css">
+</head>
+<body>
+  <main class="page">
+    <header class="hero">
+      <div>
+        <p class="eyebrow">kvm-control</p>
+        <h1>Status</h1>
+      </div>
+      <div id="socket-state" class="socket-state offline">Connecting</div>
+    </header>
+
+    <section id="summary" class="summary-grid"></section>
+
+    <section class="panel">
+      <div class="panel-header">
+        <h2>Work In Progress</h2>
+      </div>
+      <div id="work-in-progress" class="stack"></div>
+    </section>
+
+    <section class="panel">
+      <div class="panel-header">
+        <h2>Namespaces</h2>
+      </div>
+      <div id="namespaces" class="stack"></div>
+    </section>
+
+    <section class="panel">
+      <div class="panel-header">
+        <h2>Errors And Warnings</h2>
+      </div>
+      <div id="alerts" class="stack"></div>
+    </section>
+
+    <section class="panel">
+      <div class="panel-header">
+        <h2>Live Log</h2>
+      </div>
+      <div id="live-log" class="log"></div>
+    </section>
+  </main>
+
+  <script src="/status/assets/app.js"></script>
+</body>
+</html>

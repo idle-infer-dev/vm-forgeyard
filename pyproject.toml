@@ -1,0 +1,35 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "kvm-control"
+version = "0.1.0"
+description = "Host-local VM control and lock APIs"
+readme = "README.md"
+requires-python = ">=3.11"
+license = {text = "GPL-2.0-only"}
+classifiers = [
+  "License :: OSI Approved :: GNU General Public License v2 (GPLv2)",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.11",
+]
+dependencies = [
+  "fastapi>=0.115,<1",
+  "pydantic>=2.8,<3",
+  "PyYAML>=6,<7",
+  "robotframework>=7,<8",
+  "uvicorn>=0.30,<1",
+]
+
+[project.urls]
+Repository = "https://github.com/idle-infer-dev/vm-forgeyard"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+"kvm_control.status_assets" = ["*.html", "*.css", "*.js"]

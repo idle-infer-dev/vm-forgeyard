@@ -1,0 +1,285 @@
+:root {
+  --bg: #f3efe7;
+  --panel: rgba(255, 252, 247, 0.96);
+  --ink: #1f1e1a;
+  --muted: #6c665a;
+  --accent: #0f766e;
+  --warn: #b45309;
+  --error: #b42318;
+  --line: rgba(31, 30, 26, 0.12);
+  --shadow: 0 18px 36px rgba(74, 56, 31, 0.08);
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  color: var(--ink);
+  background:
+    radial-gradient(circle at top left, rgba(15, 118, 110, 0.16), transparent 30%),
+    radial-gradient(circle at top right, rgba(180, 83, 9, 0.14), transparent 26%),
+    linear-gradient(180deg, #f8f4ec 0%, var(--bg) 100%);
+  font-family: "IBM Plex Sans", "Segoe UI", sans-serif;
+}
+
+.page {
+  width: min(1360px, calc(100vw - 32px));
+  margin: 0 auto;
+  padding: 28px 0 48px;
+}
+
+.hero,
+.panel-header,
+.summary-grid,
+.namespace-header,
+.vm-meta,
+.summary-card,
+.work-item,
+.alert-item,
+.log-row {
+  animation: rise 180ms ease-out;
+}
+
+.hero {
+  display: flex;
+  justify-content: space-between;
+  gap: 16px;
+  align-items: end;
+  margin-bottom: 18px;
+}
+
+.eyebrow {
+  margin: 0 0 4px;
+  text-transform: uppercase;
+  letter-spacing: 0.18em;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+h1, h2, h3 {
+  margin: 0;
+  font-family: "IBM Plex Serif", "Georgia", serif;
+}
+
+h1 {
+  font-size: clamp(2rem, 5vw, 3.2rem);
+}
+
+.socket-state {
+  padding: 10px 14px;
+  border-radius: 999px;
+  background: rgba(31, 30, 26, 0.08);
+  font-size: 14px;
+}
+
+.socket-state.online {
+  color: var(--accent);
+  background: rgba(15, 118, 110, 0.12);
+}
+
+.socket-state.offline {
+  color: var(--warn);
+  background: rgba(180, 83, 9, 0.12);
+}
+
+.summary-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+  gap: 14px;
+  margin-bottom: 18px;
+}
+
+.summary-card,
+.panel,
+.vm-card,
+.work-item,
+.alert-item {
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 18px;
+  box-shadow: var(--shadow);
+}
+
+.summary-card {
+  padding: 16px;
+}
+
+.summary-card strong {
+  display: block;
+  font-size: 32px;
+  line-height: 1;
+  margin-top: 10px;
+}
+
+.panel {
+  padding: 18px;
+  margin-bottom: 18px;
+}
+
+.panel-header {
+  display: flex;
+  justify-content: space-between;
+  margin-bottom: 12px;
+}
+
+.stack {
+  display: grid;
+  gap: 12px;
+}
+
+.namespace-section {
+  display: grid;
+  gap: 10px;
+}
+
+.namespace-header {
+  display: flex;
+  justify-content: space-between;
+  gap: 16px;
+  align-items: baseline;
+}
+
+.namespace-stats,
+.vm-meta,
+.mini-list,
+.muted {
+  color: var(--muted);
+}
+
+.vm-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+  gap: 12px;
+}
+
+.vm-card {
+  padding: 14px;
+}
+
+.vm-title {
+  display: flex;
+  justify-content: space-between;
+  gap: 10px;
+  align-items: baseline;
+}
+
+.vm-state {
+  padding: 4px 8px;
+  border-radius: 999px;
+  background: rgba(31, 30, 26, 0.08);
+  font-size: 12px;
+}
+
+.vm-meta {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px 12px;
+  font-size: 13px;
+  margin-top: 12px;
+}
+
+.mini-list {
+  font-size: 13px;
+  margin-top: 12px;
+  border-top: 1px solid var(--line);
+  padding-top: 10px;
+}
+
+.work-item,
+.alert-item {
+  padding: 12px 14px;
+}
+
+.work-item strong,
+.alert-item strong {
+  display: block;
+  margin-bottom: 6px;
+}
+
+.alert-item.warning {
+  border-color: rgba(180, 83, 9, 0.26);
+}
+
+.alert-item.error {
+  border-color: rgba(180, 35, 24, 0.3);
+}
+
+.log {
+  display: grid;
+  gap: 8px;
+  max-height: 420px;
+  overflow: auto;
+}
+
+.log-row {
+  display: grid;
+  grid-template-columns: 130px 90px 1fr;
+  gap: 10px;
+  padding: 8px 0;
+  border-bottom: 1px solid var(--line);
+  font-size: 14px;
+}
+
+.log-row:last-child {
+  border-bottom: 0;
+}
+
+.badge {
+  display: inline-flex;
+  align-items: center;
+  padding: 2px 8px;
+  border-radius: 999px;
+  background: rgba(31, 30, 26, 0.08);
+  text-transform: uppercase;
+  font-size: 11px;
+  letter-spacing: 0.08em;
+}
+
+.badge.warning {
+  color: var(--warn);
+}
+
+.badge.error {
+  color: var(--error);
+}
+
+.empty {
+  color: var(--muted);
+  padding: 8px 0;
+}
+
+@keyframes rise {
+  from {
+    opacity: 0;
+    transform: translateY(4px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+@media (max-width: 720px) {
+  .page {
+    width: min(100vw - 20px, 1360px);
+    padding-top: 20px;
+  }
+
+  .hero,
+  .namespace-header,
+  .vm-title {
+    grid-template-columns: 1fr;
+    display: grid;
+  }
+
+  .log-row {
+    grid-template-columns: 1fr;
+    gap: 4px;
+  }
+
+  .vm-meta {
+    grid-template-columns: 1fr;
+  }
+}
