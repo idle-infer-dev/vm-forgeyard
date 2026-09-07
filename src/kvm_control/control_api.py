@@ -524,6 +524,8 @@ def create_app(services: Services | None = None) -> FastAPI:
     def _validate_nested_virtualization(requested: bool, principal: AuthPrincipal) -> None:
         if not requested:
             return
+        if not services.config.host.nested_virtualization_enabled:
+            raise HTTPException(status_code=503, detail="nested virtualization is not enabled on this host")
         allowed_repository_users = {"git.kvm-control", "git.vm-forgeyard"}
         if principal.is_admin or principal.username in allowed_repository_users:
             return

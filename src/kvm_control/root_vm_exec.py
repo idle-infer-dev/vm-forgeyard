@@ -1651,6 +1651,15 @@ def _write_runtime_xml(config: AppConfig, payload: dict[str, Any]) -> Path:
     kernel_append = payload.get("template_kernel_append")
     layer3_format = payload.get("layer3_format", "qcow2")
     network_bridge = payload["network_bridge"]
+    nested_virtualization = bool(payload.get("nested_virtualization"))
+    cpu_lines = ["  <cpu mode='host-passthrough' check='none' migratable='on'/>"]
+    if not nested_virtualization:
+        cpu_lines = [
+            "  <cpu mode='host-passthrough' check='none' migratable='on'>",
+            "    <feature policy='disable' name='vmx'/>",
+            "    <feature policy='disable' name='svm'/>",
+            "  </cpu>",
+        ]
     domain_lines = [
         "<domain type='kvm'>",
         f"  <name>{vm_id}</name>",
@@ -1675,7 +1684,7 @@ def _write_runtime_xml(config: AppConfig, payload: dict[str, Any]) -> Path:
             "    <boot dev='hd'/>",
             "  </os>",
             "  <features><acpi/><apic/></features>",
-            "  <cpu mode='host-passthrough' check='none' migratable='on'/>",
+            *cpu_lines,
             "  <devices>",
             "    <emulator>/usr/bin/qemu-system-x86_64</emulator>",
             (

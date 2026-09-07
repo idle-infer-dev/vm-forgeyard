@@ -4,6 +4,7 @@ host:
   max_total_vcpus: 24
   max_total_memory_mb: 32768
   max_layer3_per_layer2: 6
+  nested_virtualization_enabled: false
 network:
   cidr: 10.80.0.0/20
   gateway: 10.80.0.1

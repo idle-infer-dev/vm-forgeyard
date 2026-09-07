@@ -144,6 +144,7 @@ def write_config(root: Path, dry_run: bool = True) -> Path:
             "max_total_vcpus": 16,
             "max_total_memory_mb": 16384,
             "max_layer3_per_layer2": 6,
+            "nested_virtualization_enabled": True,
         },
         "network": {
             "cidr": "10.90.0.0/20",
@@ -1784,6 +1785,28 @@ class ApiTests(unittest.TestCase):
         )
         self.assertEqual(nested_allowed.status_code, 202)
         self.assertTrue(nested_allowed.json()["nested_virtualization"])
+
+        config["host"]["nested_virtualization_enabled"] = False
+        self.config_path.write_text(json.dumps(config))
+        disabled_services = build_services(str(self.config_path))
+        try:
+            disabled_control = TestClient(create_control_app(disabled_services))
+            host_denied = disabled_control.post(
+                "/v1/vms",
+                json={
+                    "template_id": "ubuntu-24.04",
+                    "vm_slot": "nested-host-denied",
+                    "network_id": "dev",
+                    "autostart": False,
+                    "agent_session_id": "pytest-auth-session",
+                    "nested_virtualization": True,
+                },
+                headers=kvm_control_headers,
+            )
+            self.assertEqual(host_denied.status_code, 503)
+            self.assertEqual(host_denied.json()["detail"], "nested virtualization is not enabled on this host")
+        finally:
+            disabled_services.monitor.stop()
 
         dev_vm = self.control.post(
             "/v1/vms",

@@ -135,7 +135,10 @@ class RootVmExecTests(unittest.TestCase):
         self.assertTrue(runtime_xml.exists())
         self.assertTrue(runtime_json.exists())
         self.assertTrue(guest_bootstrap.exists())
-        self.assertIn("machine='pc'", runtime_xml.read_text(encoding="utf-8"))
+        runtime_xml_text = runtime_xml.read_text(encoding="utf-8")
+        self.assertIn("machine='pc'", runtime_xml_text)
+        self.assertIn("<feature policy='disable' name='vmx'/>", runtime_xml_text)
+        self.assertIn("<feature policy='disable' name='svm'/>", runtime_xml_text)
         virsh.assert_has_calls(
             [
                 call(["undefine", "repo-a--node1"], check=False),
@@ -168,6 +171,27 @@ class RootVmExecTests(unittest.TestCase):
 
         layer3_files = result["guest_bootstrap"]
         self.assertEqual(layer3_files["mode"], "test-stub")
+
+    def test_start_vm_exposes_nested_virtualization_only_when_granted(self) -> None:
+        payload = self._payload()
+        payload["nested_virtualization"] = True
+        runtime_xml = self.config.storage.runtime_dir / "repo-a--node1.xml"
+
+        with (
+            patch("kvm_control.root_vm_exec._libvirt_available", return_value=True),
+            patch("kvm_control.root_vm_exec._domain_exists", return_value=True),
+            patch("kvm_control.root_vm_exec._domain_state", side_effect=["shut off", "shut off"]),
+            patch("kvm_control.root_vm_exec._wait_for_domain_state", return_value="running"),
+            patch("kvm_control.root_vm_exec._require_kvm_device"),
+            patch("kvm_control.root_vm_exec._virsh"),
+        ):
+            result = handle_request(self.config, "start-vm", payload)
+
+        self.assertEqual(result["result"], "ok")
+        runtime_xml_text = runtime_xml.read_text(encoding="utf-8")
+        self.assertIn("<cpu mode='host-passthrough' check='none' migratable='on'/>", runtime_xml_text)
+        self.assertNotIn("name='vmx'", runtime_xml_text)
+        self.assertNotIn("name='svm'", runtime_xml_text)
 
     def test_create_layer3_uses_unvalidated_backing_with_layer2_virtual_size(self) -> None:
         payload = self._payload()
