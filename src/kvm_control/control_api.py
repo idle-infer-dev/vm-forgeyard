@@ -31,6 +31,7 @@ from .auth import (
 )
 from .config import base_image_recipe_map, config_to_dict, layer2_image_recipe_map, template_map
 from .firewall import reconcile_firewall_access, reconcile_firewall_egress
+from .host_capabilities import probe_nested_virtualization
 from .models import (
     CreateLockRequest,
     CreateRunRequest,
@@ -526,6 +527,11 @@ def create_app(services: Services | None = None) -> FastAPI:
             return
         if not services.config.host.nested_virtualization_enabled:
             raise HTTPException(status_code=503, detail="nested virtualization is not enabled on this host")
+        if not services.config.dry_run:
+            probe = probe_nested_virtualization()
+            if not probe["supported"]:
+                reason = probe.get("reason") or "host probe failed"
+                raise HTTPException(status_code=503, detail=f"nested virtualization is not supported on this host: {reason}")
         allowed_repository_users = {"git.kvm-control", "git.vm-forgeyard"}
         if principal.is_admin or principal.username in allowed_repository_users:
             return

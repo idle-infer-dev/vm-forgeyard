@@ -368,6 +368,37 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(restart.status_code, 202)
         self.assertEqual(restart.json()["readiness_state"], "booting")
 
+    def test_nested_virtualization_probe_fails_closed_outside_dry_run(self) -> None:
+        self.tmp.cleanup()
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+        self.config_path = write_config(self.root, dry_run=False)
+        self.services = build_services(str(self.config_path))
+        self.control = TestClient(create_control_app(self.services))
+
+        payload = {
+            "namespace": "repo-nested-probe",
+            "template_id": "missing-template",
+            "vm_slot": "probe",
+            "autostart": False,
+            "nested_virtualization": True,
+        }
+        with patch(
+            "kvm_control.control_api.probe_nested_virtualization",
+            return_value={"supported": False, "reason": "kvm_amd nested parameter is disabled"},
+        ):
+            denied = self.control.post("/v1/vms", json=payload)
+        self.assertEqual(denied.status_code, 503)
+        self.assertIn("kvm_amd nested parameter is disabled", denied.json()["detail"])
+
+        with patch(
+            "kvm_control.control_api.probe_nested_virtualization",
+            return_value={"supported": True, "reason": None},
+        ):
+            template_denied = self.control.post("/v1/vms", json=payload)
+        self.assertEqual(template_denied.status_code, 422)
+        self.assertEqual(template_denied.json()["detail"]["reason"], "unknown template")
+
     def test_wait_vm_ready_marks_ready_after_reserved_ip_ssh_reachable(self) -> None:
         create = self.control.post(
             "/v1/vms",
