@@ -1,0 +1,141 @@
+$schema: "https://json-schema.org/draft/2020-12/schema"
+$id: "kvm-control://contracts/workflow-contract.schema.v1"
+title: kvm-control workflow contract
+type: object
+required:
+  - schema_version
+  - id
+  - status
+  - summary
+  - classification
+  - actors
+  - auth
+  - preconditions
+  - steps
+  - success_criteria
+  - bug_indicators
+  - feature_request_indicators
+  - documentation_gap_indicators
+  - related
+additionalProperties: false
+properties:
+  schema_version:
+    const: 1
+  id:
+    type: string
+    pattern: "^[a-z0-9][a-z0-9._:-]+$"
+  status:
+    enum:
+      - intended
+      - implemented
+      - partially_implemented
+      - planned
+      - deprecated
+  summary:
+    type: string
+  classification:
+    type: object
+    required:
+      - purpose
+      - default_rule
+    additionalProperties: false
+    properties:
+      purpose:
+        type: string
+      default_rule:
+        type: string
+      categories:
+        type: array
+        items:
+          type: object
+          required:
+            - name
+            - meaning
+          additionalProperties: false
+          properties:
+            name:
+              enum:
+                - bug
+                - feature_request
+                - documentation_gap
+                - policy_rejection
+            meaning:
+              type: string
+  actors:
+    type: array
+    items:
+      type: string
+  auth:
+    type: object
+    additionalProperties: true
+  preconditions:
+    type: array
+    items:
+      type: object
+      required:
+        - level
+        - text
+      additionalProperties: false
+      properties:
+        level:
+          enum:
+            - MUST
+            - SHOULD
+            - MAY
+        text:
+          type: string
+  steps:
+    type: array
+    items:
+      type: object
+      required:
+        - id
+        - actor
+        - action
+        - expected
+      additionalProperties: false
+      properties:
+        id:
+          type: string
+        actor:
+          type: string
+        action:
+          type: string
+        expected:
+          type: string
+  success_criteria:
+    type: array
+    items:
+      type: string
+  bug_indicators:
+    type: array
+    items:
+      type: string
+  feature_request_indicators:
+    type: array
+    items:
+      type: string
+  documentation_gap_indicators:
+    type: array
+    items:
+      type: string
+  related:
+    type: object
+    additionalProperties: false
+    properties:
+      mcp_resources:
+        type: array
+        items:
+          type: string
+      mcp_tools:
+        type: array
+        items:
+          type: string
+      http_paths:
+        type: array
+        items:
+          type: string
+      files:
+        type: array
+        items:
+          type: string

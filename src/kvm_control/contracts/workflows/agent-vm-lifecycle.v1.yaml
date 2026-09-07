@@ -1,0 +1,135 @@
+schema_version: 1
+id: agent-vm-lifecycle.v1
+status: implemented
+summary: >
+  A repository agent locks its namespace, orders a VM, waits for reserved-IP SSH
+  readiness, uses the VM, refreshes the lease while active, and releases or
+  cleans up when done.
+classification:
+  purpose: >
+    Distinguish broken VM lifecycle behavior from requests for new scheduling,
+    networking, or guest-management features.
+  default_rule: >
+    Treat failures of listed lifecycle steps as bugs when auth, namespace lock,
+    template, network, capacity, and source-scope preconditions are satisfied.
+    Treat alternate scheduling semantics, alternate readiness probes, and
+    broader network behavior as feature requests unless another implemented
+    contract requires them.
+  categories:
+    - name: bug
+      meaning: An implemented lifecycle step fails or reports success without meeting its expected result.
+    - name: feature_request
+      meaning: The report asks for lifecycle, scheduling, readiness, storage, or network behavior outside this contract.
+    - name: documentation_gap
+      meaning: A required lifecycle detail is implemented but not discoverable through MCP/docs/contracts.
+    - name: policy_rejection
+      meaning: The request was intentionally denied by auth, namespace, lock, capacity, template, network, or capability policy.
+actors:
+  - repository-agent
+  - mcp-api
+  - control-api
+  - lock-api
+  - root-vm-exec
+  - guest-vm
+auth:
+  token_header: "Authorization: Bearer <repository-token>"
+  namespace_scope: Repository tokens may operate only in their own git.<repository> namespace.
+  required_order_field: agent_session_id
+preconditions:
+  - level: MUST
+    text: The agent has a repository bearer token accepted for its namespace and source address.
+  - level: MUST
+    text: The requested template_id exists in GET /v1/templates.
+  - level: MUST
+    text: The requested network_id is one of the networks listed by kvm-control://environments.
+  - level: MUST
+    text: The VM order includes agent_session_id.
+  - level: SHOULD
+    text: The VM order includes the caller's ssh_public_key so the agent can log in after readiness.
+  - level: SHOULD
+    text: The agent holds resource_id namespace:<namespace> while creating and using VMs.
+steps:
+  - id: inspect-environment
+    actor: repository-agent
+    action: Read kvm-control://environments and list_templates before ordering.
+    expected: The agent selects an available template_id and network_id from the advertised data.
+  - id: acquire-lock
+    actor: repository-agent
+    action: Call request_lock for resource_id namespace:<namespace>.
+    expected: The lock is granted or a queue/lock-blocked status is returned.
+  - id: order-vm
+    actor: repository-agent
+    action: Call order_vm with namespace, template_id, vm_slot, agent_session_id, network_id, and optional ssh_public_key.
+    expected: The control API creates or reuses the namespace/template layer2, creates a per-VM layer3, starts the VM, and returns reserved_ip.
+  - id: wait-ready
+    actor: repository-agent
+    action: Call wait_for_vm_ready for the returned vm_id.
+    expected: Success means a non-interactive root SSH command against reserved_ip succeeds from the host-side executor and ssh_target points to root@reserved_ip; it does not separately verify SCP transfer or SFTP subsystem availability.
+  - id: use-vm
+    actor: repository-agent
+    action: Connect to root@reserved_ip and run the testsuite or setup workflow.
+    expected: current_ip, when present, is diagnostic DHCP observation and not the normal target.
+  - id: maintain-lease
+    actor: repository-agent
+    action: Call refresh_lease while active use continues.
+    expected: The namespace lock lease expiration is extended up to the configured maximum.
+  - id: cleanup
+    actor: repository-agent
+    action: Stop, retain, archive, promote, delete, or release the VM and release the namespace lock when done.
+    expected: Disposable layer3 state is moved to trash and physically removed by background cleanup after the configured TTL.
+success_criteria:
+  - order_vm requires agent_session_id through MCP and forwards the request to the control API.
+  - wait_for_vm_ready reports ready only after a non-interactive root SSH command against reserved_ip succeeds when SSH checking is enabled.
+  - wait_for_vm_ready responses expose that the readiness_probe is root_ssh_command, SSH login is verified, and SCP is not separately verified by the API.
+  - Repository tokens cannot manage VMs outside their own namespace.
+  - Namespace-lock lease refresh works through MCP and HTTP.
+  - Stale trash files are physically removed after cleanup.trash_file_ttl_seconds.
+bug_indicators:
+  - get_capacity or other operational MCP calls return 403 for a token that direct HTTP accepts from the same effective source.
+  - wait_for_vm_ready returns ready=true while a non-interactive root SSH command against reserved_ip fails with SSH checking enabled.
+  - wait_for_vm_ready returns ready=true but ssh_login_verified is false with SSH checking enabled.
+  - SCP to ssh_target is refused after wait_for_vm_ready returned ready=true and ssh_login_verified=true.
+  - reserved_ip for an ordered VM is inside the configured dynamic DHCP pool for its network segment.
+  - A repository token can create, mutate, or delete VMs in a different namespace.
+  - The cleanup worker leaves direct trash files older than cleanup.trash_file_ttl_seconds in place after a cleanup pass.
+feature_request_indicators:
+  - The report asks for non-FIFO scheduling, priority queues, or fairness tuning beyond current lock behavior.
+  - The report asks for readiness based on application-level health checks instead of reserved-IP SSH readiness.
+  - The report asks for wait_for_vm_ready to verify application-level readiness beyond root SSH command execution.
+  - The report asks for wait_for_vm_ready to separately verify SCP transfer or SFTP subsystem availability.
+  - The report asks to use current_ip as the normal target or expose temporary DHCP addressing as a stable API contract.
+  - The report asks for recursive trash cleanup of directories rather than direct file cleanup in storage.trash_dir.
+documentation_gap_indicators:
+  - The agent cannot discover that agent_session_id is required before calling order_vm.
+  - The agent cannot discover that root@reserved_ip is the normal SSH target.
+  - The agent cannot discover that wait_for_vm_ready verifies a root SSH command but does not separately verify SCP.
+  - README, MCP concept resources, and this workflow disagree on lock, readiness, or cleanup behavior.
+related:
+  mcp_resources:
+    - kvm-control://concepts/agent-workflow
+    - kvm-control://concepts/networking
+    - kvm-control://environments
+  mcp_tools:
+    - get_capacity
+    - list_templates
+    - request_lock
+    - refresh_lease
+    - release_lock
+    - order_vm
+    - wait_for_vm_ready
+    - set_vm_retention
+    - list_archived_vms
+  http_paths:
+    - GET /v1/templates
+    - GET /v1/capacity
+    - POST /v1/locks/requests
+    - POST /v1/locks/requests/{request_id}/lease/refresh
+    - POST /v1/vms
+    - POST /v1/vms/{vm_id}/wait-ready
+    - POST /v1/vms/{vm_id}/retention
+    - DELETE /v1/vms/{vm_id}
+  files:
+    - src/kvm_control/control_api.py
+    - src/kvm_control/lock_api.py
+    - src/kvm_control/mcp_api.py
+    - src/kvm_control/vm_cleanup.py

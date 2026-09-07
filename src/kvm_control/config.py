@@ -20,12 +20,20 @@ class HostConfig(BaseModel):
     max_layer3_per_layer2: int = 6
 
 
+class NetworkSegmentConfig(BaseModel):
+    id: str
+    bridge: str
+    address: str | None = None
+    dhcp_range_start: str | None = None
+    dhcp_range_end: str | None = None
+
+
 class NetworkConfig(BaseModel):
     cidr: str = "10.80.0.0/20"
     gateway: str = "10.80.0.1"
     dhcp_cidr: str = "10.81.0.0/24"
     mac_prefix: str = "52:54:00"
-    segments: list["NetworkSegmentConfig"] = Field(
+    segments: list[NetworkSegmentConfig] = Field(
         default_factory=lambda: [
             NetworkSegmentConfig(id="dev", bridge="dev"),
             NetworkSegmentConfig(id="stage", bridge="stage"),
@@ -35,20 +43,20 @@ class NetworkConfig(BaseModel):
     )
 
 
-class NetworkSegmentConfig(BaseModel):
-    id: str
-    bridge: str
-    address: str | None = None
-    dhcp_range_start: str | None = None
-    dhcp_range_end: str | None = None
-
-
 class FirewallConfig(BaseModel):
     default_ingress_sources: list[str] = Field(default_factory=lambda: ["10.0.0.0/8"])
 
 
 class LeaseConfig(BaseModel):
     namespace_lock_ttl_seconds: int = 2 * 60 * 60
+    max_namespace_lock_ttl_seconds: int = 7 * 24 * 60 * 60
+
+
+class CleanupConfig(BaseModel):
+    stopped_ephemeral_vm_ttl_seconds: int = 24 * 60 * 60
+    stopped_ephemeral_vm_cleanup_interval_seconds: int = 3 * 60 * 60
+    trash_file_ttl_seconds: int = 24 * 60 * 60
+    trash_file_cleanup_interval_seconds: int = 3 * 60 * 60
 
 
 class GuestBootstrapConfig(BaseModel):
@@ -125,6 +133,7 @@ def default_layer2_image_recipes() -> list[Layer2ImageRecipeConfig]:
         "build-essential",
         "ca-certificates",
         "curl",
+        "dnsmasq",
         "dnsutils",
         "file",
         "git",
@@ -134,6 +143,7 @@ def default_layer2_image_recipes() -> list[Layer2ImageRecipeConfig]:
         "make",
         "man-db",
         "netcat-openbsd",
+        "nfs-common",
         "openssh-client",
         "pkg-config",
         "pipx",
@@ -172,7 +182,18 @@ def default_layer2_image_recipes() -> list[Layer2ImageRecipeConfig]:
             ),
             keywords=["agent", "sandbox", "tools", "ubuntu", "noble", "ripgrep", "build-essential", "python-venv", "user-only"],
             builder_implemented=True,
-            system_packages=common_agent_tools,
+            system_packages=common_agent_tools
+            + [
+                "python3-fastapi",
+                "python3-pydantic",
+                "python3-uvicorn",
+                "python3-yaml",
+                "kmod",
+                "libvirt-clients",
+                "libvirt-daemon-system",
+                "qemu-system-x86",
+                "qemu-utils",
+            ],
             python_venv_tools=[],
             user_accounts=[
                 Layer2UserAccountConfig(username=f"agent{i}", groups=["users"], sudo=False, notes="Non-root reusable agent login account.")
@@ -465,6 +486,7 @@ class TemplateConfig(BaseModel):
     base_image: str
     base_image_format: Literal["qcow2", "raw"] = "qcow2"
     architecture: str = "x86_64"
+    machine_type: str = "pc-i440fx-10.0"
     boot_mode: Literal["disk", "direct_kernel"] = "disk"
     kernel_path: str | None = None
     initrd_path: str | None = None
@@ -480,6 +502,7 @@ class AppConfig(BaseModel):
     network: NetworkConfig = Field(default_factory=NetworkConfig)
     firewall: FirewallConfig = Field(default_factory=FirewallConfig)
     leases: LeaseConfig = Field(default_factory=LeaseConfig)
+    cleanup: CleanupConfig = Field(default_factory=CleanupConfig)
     guest_bootstrap: GuestBootstrapConfig = Field(default_factory=GuestBootstrapConfig)
     image_factory: ImageFactoryConfig = Field(default_factory=ImageFactoryConfig)
     storage: StorageConfig = Field(default_factory=StorageConfig)

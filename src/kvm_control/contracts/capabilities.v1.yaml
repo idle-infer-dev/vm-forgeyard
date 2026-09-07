@@ -1,0 +1,50 @@
+schema_version: 1
+id: kvm-control.capabilities.v1
+status: implemented
+summary: >
+  Versioned index of intended kvm-control API and MCP behavior that agents can
+  use when classifying observations as bugs, feature requests, documentation
+  gaps, or policy rejections.
+classification:
+  purpose: >
+    Give agents a machine-readable support boundary before they write bug
+    reports or ask for new behavior.
+  default_rule: >
+    If a behavior is required by an implemented contract and fails under its
+    stated preconditions, classify it as a bug. If the desired behavior is not
+    required by an implemented contract, classify it as a feature request unless
+    the public docs imply support but the contract omits it.
+  categories:
+    - name: bug
+      meaning: Required documented behavior failed while preconditions were met.
+    - name: feature_request
+      meaning: Desired behavior is useful but outside the implemented contract.
+    - name: documentation_gap
+      meaning: Behavior is implemented or implied elsewhere but missing or ambiguous here.
+    - name: policy_rejection
+      meaning: The system intentionally rejected a request because auth, namespace, quota, lock, or host policy did not allow it.
+workflows:
+  - id: repository-onboarding.v1
+    uri: kvm-control://contracts/workflows/repository-onboarding.v1
+    file: workflows/repository-onboarding.v1.yaml
+    status: implemented
+  - id: agent-vm-lifecycle.v1
+    uri: kvm-control://contracts/workflows/agent-vm-lifecycle.v1
+    file: workflows/agent-vm-lifecycle.v1.yaml
+    status: implemented
+  - id: namespace-lock-leases.v1
+    uri: kvm-control://contracts/workflows/namespace-lock-leases.v1
+    file: workflows/namespace-lock-leases.v1.yaml
+    status: implemented
+  - id: trash-cleanup.v1
+    uri: kvm-control://contracts/workflows/trash-cleanup.v1
+    file: workflows/trash-cleanup.v1.yaml
+    status: implemented
+related:
+  mcp_resources:
+    - kvm-control://auth/onboarding
+    - kvm-control://concepts/agent-workflow
+    - kvm-control://environments
+  files:
+    - README.md
+    - plan.md

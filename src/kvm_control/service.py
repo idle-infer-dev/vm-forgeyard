@@ -19,7 +19,7 @@ class Services:
     status_bus: StatusEventBus
 
 
-def build_services(config_path: str | None = None) -> Services:
+def build_services(config_path: str | None = None, *, start_monitor: bool = True) -> Services:
     config = load_config(config_path or os.environ.get("KVM_CONTROL_CONFIG"))
     status_bus = StatusEventBus()
     registry = Registry(config, status_bus=status_bus)
@@ -32,5 +32,6 @@ def build_services(config_path: str | None = None) -> Services:
         monitor=monitor,
         status_bus=status_bus,
     )
-    services.monitor.start()
+    if start_monitor:
+        services.monitor.start()
     return services

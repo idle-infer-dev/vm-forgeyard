@@ -13,6 +13,9 @@ from pathlib import Path
 
 
 def _write_config(root: Path, control_port: int, lock_port: int, disk_full_threshold_bytes: int | None = None) -> Path:
+    base_dir = root / "base"
+    base_dir.mkdir(parents=True, exist_ok=True)
+    (base_dir / "ubuntu-24.04-base.qcow2").write_text(json.dumps({"format": "qcow2"}), encoding="utf-8")
     config = {
         "host": {
             "vm_cpu_set": [0, 1, 2, 3],
@@ -317,7 +320,10 @@ def main() -> int:
             assert isinstance(ips, list)
             assert any(entry["ip_address"] == reserved_ip for entry in ips)
 
-            _request("DELETE", f"{control_base}/v1/vms/{vm_id}", expected_status=204)
+            deleted = _request("DELETE", f"{control_base}/v1/vms/{vm_id}", expected_status=202)
+            assert isinstance(deleted, dict)
+            assert deleted["action"] == "delete"
+            assert deleted["status"] == "completed"
             _request(
                 "POST",
                 f"{lock_base}/v1/locks/requests/{first_lock['id']}/release",

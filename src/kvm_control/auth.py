@@ -40,12 +40,27 @@ def generate_token(token_id: str | None = None) -> tuple[str, str, str]:
     return token_id, secret, f"kvm_{token_id}_{secret}"
 
 
+def generate_self_registration_key(key_id: str | None = None) -> tuple[str, str, str]:
+    key_id = key_id or secrets.token_hex(12)
+    secret = secrets.token_urlsafe(32)
+    return key_id, secret, f"kvmreg_{key_id}_{secret}"
+
+
 def hash_token_secret(secret: str) -> str:
     return hashlib.sha256(secret.encode("utf-8")).hexdigest()
 
 
 def split_token(token: str) -> tuple[str, str] | None:
     if not token.startswith("kvm_"):
+        return None
+    parts = token.split("_", 2)
+    if len(parts) != 3 or not parts[1] or not parts[2]:
+        return None
+    return parts[1], parts[2]
+
+
+def split_self_registration_key(token: str) -> tuple[str, str] | None:
+    if not token.startswith("kvmreg_"):
         return None
     parts = token.split("_", 2)
     if len(parts) != 3 or not parts[1] or not parts[2]:

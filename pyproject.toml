@@ -33,3 +33,4 @@ where = ["src"]
 
 [tool.setuptools.package-data]
 "kvm_control.status_assets" = ["*.html", "*.css", "*.js"]
+"kvm_control.contracts" = ["*.yaml", "workflows/*.yaml"]

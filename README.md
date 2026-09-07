@@ -13,6 +13,8 @@ It provides:
 - `root-vm-exec`: a narrow request-file executor for qcow2, libvirt lifecycle,
   guest bootstrap, runtime inspection, and cleanup actions
 - SQLite-backed control-plane state
+- repository-scoped bearer tokens with optional self-registration
+- machine-readable MCP workflow contracts for bug/feature-report drafting
 - dry-run modes for API and executor workflow verification
 
 ## Status
@@ -53,8 +55,39 @@ Repository tokens use `git.<repo>` usernames and inherit that effective
 namespace. The reserved `dev` token accepts caller-provided namespaces and
 normalizes unprefixed names to `dev.<name>`.
 
+Agents should look for repository-scoped tokens at `./repo.auth.token`; that
+file is intentionally gitignored. An admin may also create a repository
+self-registration key with:
+
+```text
+POST /v1/admin/auth/repository-self-registration-keys
+```
+
+An agent holding that self-registration key can then call:
+
+```text
+POST /v1/auth/repository-self-registration
+```
+
+The response contains a repository token to write to `./repo.auth.token`.
+Existing active repository registrations cannot be overwritten by
+self-registration.
+
 `auth.mode: open` exists only as a rollout bridge. Requests without credentials
 run as anonymous admin, while provided credentials are still validated.
+
+## Agent Workflows
+
+The MCP server exposes concept resources and workflow contracts. Agents should
+read `kvm-control://auth/onboarding` and
+`kvm-control://concepts/agent-workflow` before ordering VMs. The
+`wait_for_vm_ready` tool reports ready only after a non-interactive root SSH
+command succeeds against the VM's reserved IP. It does not separately verify
+SCP or SFTP availability.
+
+The `draft_contract_report` MCP tool and `scripts/draft_contract_report.py`
+can classify observations against the workflow contracts as likely bugs,
+feature requests, or documentation gaps.
 
 ## Development Checks
 
@@ -70,6 +103,7 @@ Run dry-run smoke checks:
 PYTHONPATH=src python scripts/sandbox_api_smoke.py
 PYTHONPATH=src python scripts/check_api_dry_run.py
 PYTHONPATH=src python scripts/check_browser_mobile_layer2_dry_run.py
+PYTHONPATH=src python scripts/check_contracts.py
 ```
 
 Check an MCP endpoint:

@@ -4,6 +4,7 @@ import json
 import unittest
 from unittest.mock import patch
 
+import yaml
 from fastapi.testclient import TestClient
 
 from kvm_control.mcp_api import create_app
@@ -37,7 +38,7 @@ class FakeKvmClient:
                     "id": 10,
                     "namespace": query.get("namespace") if query else None,
                     "mode": "cidr",
-                    "target_cidr": "198.51.100.42",
+                    "target_cidr": "192.0.2.42",
                 }
             ]
         if path == "/v1/firewall/access-rules":
@@ -46,7 +47,7 @@ class FakeKvmClient:
                     "id": 11,
                     "namespace": query.get("namespace") if query else None,
                     "target_zone": "dev",
-                    "source_cidr": "198.51.100.42",
+                    "source_cidr": "192.0.2.42",
                 }
             ]
         if path == "/v1/endpoint-workarounds":
@@ -58,7 +59,7 @@ class FakeKvmClient:
                     "kind": "fqdn",
                     "value": "updates.example.test",
                     "workaround_type": "hosts_entry",
-                    "target_ip": "198.51.100.42",
+                    "target_ip": "192.0.2.42",
                     "apply_on": ["appliance"],
                 }
             ]
@@ -149,6 +150,11 @@ class McpApiTests(unittest.TestCase):
         self.assertIn("create_firewall_access_rule", names)
         self.assertIn("create_endpoint_workaround", names)
         self.assertIn("refresh_lease", names)
+        self.assertIn("draft_contract_report", names)
+        request_lock = next(tool for tool in listed_tools if tool["name"] == "request_lock")
+        self.assertIn("lease_ttl_seconds", request_lock["inputSchema"]["properties"])
+        refresh_lease = next(tool for tool in listed_tools if tool["name"] == "refresh_lease")
+        self.assertIn("lease_ttl_seconds", refresh_lease["inputSchema"]["properties"])
         list_vms = next(tool for tool in listed_tools if tool["name"] == "list_vms")
         self.assertIn("reserved_ip", list_vms["description"])
         self.assertIn("root@reserved_ip", list_vms["description"])
@@ -165,9 +171,11 @@ class McpApiTests(unittest.TestCase):
         self.assertIn("purpose", order_vm["inputSchema"]["properties"])
         self.assertIn("agent_session_id", order_vm["inputSchema"]["properties"])
         self.assertIn("ssh_public_key", order_vm["inputSchema"]["properties"])
+        self.assertIn("nested_virtualization", order_vm["inputSchema"]["properties"])
         self.assertIn("agent_session_id", order_vm["inputSchema"]["required"])
         self.assertIn("agent_session_id is required", order_vm["description"])
         self.assertIn("ssh_public_key", order_vm["description"])
+        self.assertIn("nested_virtualization", order_vm["description"])
         self.assertIn("reserved_ip", order_vm["description"])
         self.assertIn("root@reserved_ip", order_vm["description"])
         self.assertIn("normal SSH login", order_vm["description"])
@@ -175,8 +183,10 @@ class McpApiTests(unittest.TestCase):
         self.assertIn("current_ip", order_vm["description"])
         self.assertIn("wait_for_vm_ready", order_vm["description"])
         wait_ready = next(tool for tool in listed_tools if tool["name"] == "wait_for_vm_ready")
-        self.assertIn("reserved_ip tcp/22", wait_ready["description"])
+        self.assertIn("root SSH", wait_ready["description"])
         self.assertIn("ssh_target", wait_ready["description"])
+        self.assertIn("SFTP", wait_ready["description"])
+        self.assertIn("SCP", wait_ready["description"])
         self.assertIn("check_ssh", wait_ready["inputSchema"]["properties"])
         promote = next(tool for tool in listed_tools if tool["name"] == "promote_vm_layer2")
         self.assertIn("setup VM", promote["description"])
@@ -192,6 +202,22 @@ class McpApiTests(unittest.TestCase):
         release_lock = next(tool for tool in listed_tools if tool["name"] == "release_lock")
         self.assertIn("same namespace", release_lock["description"])
         self.assertIn("not the resource_id", release_lock["description"])
+        draft_report = next(tool for tool in listed_tools if tool["name"] == "draft_contract_report")
+        self.assertIn("workflow_id", draft_report["inputSchema"]["required"])
+        self.assertIn("observed", draft_report["inputSchema"]["required"])
+        self.assertIn("feature-request", draft_report["description"])
+
+    def test_list_resources_includes_machine_readable_contracts(self) -> None:
+        result = self.rpc("resources/list")
+        resources = result["result"]["resources"]
+        by_uri = {resource["uri"]: resource for resource in resources}
+        self.assertEqual(by_uri["kvm-control://contracts/capabilities.v1"]["mimeType"], "application/yaml")
+        self.assertEqual(by_uri["kvm-control://contracts/workflow-contract.schema.v1"]["mimeType"], "application/yaml")
+        self.assertEqual(by_uri["kvm-control://contracts/workflows/repository-onboarding.v1"]["mimeType"], "application/yaml")
+        self.assertEqual(by_uri["kvm-control://contracts/workflows/agent-vm-lifecycle.v1"]["mimeType"], "application/yaml")
+        self.assertEqual(by_uri["kvm-control://contracts/workflows/namespace-lock-leases.v1"]["mimeType"], "application/yaml")
+        self.assertEqual(by_uri["kvm-control://contracts/workflows/trash-cleanup.v1"]["mimeType"], "application/yaml")
+        self.assertIn("feature requests", by_uri["kvm-control://contracts/capabilities.v1"]["description"])
 
     def test_order_vm_forwards_to_control_api(self) -> None:
         result = self.rpc(
@@ -205,6 +231,7 @@ class McpApiTests(unittest.TestCase):
                     "layer3_size_mb": 4096,
                     "agent_session_id": "pytest-mcp-session",
                     "ssh_public_key": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAITestKey pytest-agent",
+                    "nested_virtualization": True,
                 },
             },
         )
@@ -214,6 +241,7 @@ class McpApiTests(unittest.TestCase):
         self.assertEqual(payload["layer3_size_mb"], 4096)
         self.assertEqual(payload["agent_session_id"], "pytest-mcp-session")
         self.assertEqual(payload["ssh_public_key"], "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAITestKey pytest-agent")
+        self.assertTrue(payload["nested_virtualization"])
         self.assertEqual(result["result"]["structuredContent"]["ssh_target"], "root@10.80.1.23")
         self.assertIn("wait_for_vm_ready", result["result"]["structuredContent"]["next_step"])
         self.assertIn(("post_control", "/v1/vms", payload), self.fake.calls)
@@ -250,6 +278,26 @@ class McpApiTests(unittest.TestCase):
         self.assertEqual(result["result"]["structuredContent"]["ssh_target"], "root@10.80.1.23")
         self.assertEqual(payload, {"timeout_s": 30, "poll_interval_s": 2, "check_ssh": True})
         self.assertIn(("post_control", "/v1/vms/vm-a/wait-ready", payload), self.fake.calls)
+
+    def test_draft_contract_report_tool_uses_packaged_contracts(self) -> None:
+        result = self.rpc(
+            "tools/call",
+            {
+                "name": "draft_contract_report",
+                "arguments": {
+                    "workflow_id": "agent-vm-lifecycle.v1",
+                    "observed": "get_capacity returns 403 through MCP but direct HTTP accepts the same token from the same source",
+                    "expected": "Operational MCP calls should authorize like direct HTTP for the same effective source.",
+                    "include_markdown": True,
+                },
+            },
+        )
+        payload = result["result"]["structuredContent"]
+        self.assertEqual(payload["classification"], "bug")
+        self.assertEqual(payload["workflow_id"], "agent-vm-lifecycle.v1")
+        self.assertIn("get_capacity", payload["matched_indicators"]["bug"][0])
+        self.assertIn("Classification: `bug`", payload["markdown"])
+        self.assertNotIn("get_control", [call[0] for call in self.fake.calls])
 
     def test_promote_vm_layer2_forwards_to_control_api(self) -> None:
         result = self.rpc(
@@ -334,7 +382,7 @@ class McpApiTests(unittest.TestCase):
             "tools/call",
             {"name": "list_firewall_egress_rules", "arguments": {"namespace": "repo-a"}},
         )
-        self.assertEqual(listed["result"]["structuredContent"][0]["target_cidr"], "198.51.100.42")
+        self.assertEqual(listed["result"]["structuredContent"][0]["target_cidr"], "192.0.2.42")
         self.assertIn(("get_control", "/v1/firewall/egress-rules", {"namespace": "repo-a"}), self.fake.calls)
 
         created = self.rpc(
@@ -345,7 +393,7 @@ class McpApiTests(unittest.TestCase):
                     "namespace": "repo-a",
                     "lock_resource_id": "namespace:repo-a",
                     "mode": "cidr",
-                    "target_cidr": "198.51.100.42",
+                    "target_cidr": "192.0.2.42",
                 },
             },
         )
@@ -373,7 +421,7 @@ class McpApiTests(unittest.TestCase):
                     "namespace": "repo-a",
                     "lock_resource_id": "namespace:repo-a",
                     "target_zone": "dev",
-                    "source_cidr": "198.51.100.42",
+                    "source_cidr": "192.0.2.42",
                 },
             },
         )
@@ -403,7 +451,7 @@ class McpApiTests(unittest.TestCase):
                     "kind": "ip",
                     "value": "203.0.113.10",
                     "workaround_type": "dnat",
-                    "target_ip": "198.51.100.42",
+                    "target_ip": "192.0.2.42",
                     "apply_on": ["appliance"],
                     "maps_to_service": "payment_simulator",
                 },
@@ -433,7 +481,9 @@ class McpApiTests(unittest.TestCase):
         self.assertIn("connect to the VM through `reserved_ip`", text)
         self.assertIn("normal SSH", text)
         self.assertIn("`root@reserved_ip`", text)
-        self.assertIn("reserved-IP\nSSH reachability", text)
+        self.assertIn("non-interactive root SSH command", text)
+        self.assertIn("does not separately prove SCP", text)
+        self.assertIn("SCP", text)
         self.assertIn("`ssh_public_key`", text)
         self.assertIn("`current_ip`", text)
         self.assertIn("debugging", text)
@@ -458,6 +508,52 @@ class McpApiTests(unittest.TestCase):
         self.assertIn("root@reserved_ip", text)
         self.assertIn("refresh_lease", text)
 
+    def test_read_auth_onboarding_resource(self) -> None:
+        result = self.rpc("resources/read", {"uri": "kvm-control://auth/onboarding"})
+        text = result["result"]["contents"][0]["text"]
+        self.assertIn("Authorization: Bearer", text)
+        self.assertIn("./repo.auth.token", text)
+        self.assertIn("~/.kvm-control-self-register.key", text)
+        self.assertIn("/v1/auth/repository-self-registration", text)
+
+    def test_read_capability_contract_resource(self) -> None:
+        result = self.rpc("resources/read", {"uri": "kvm-control://contracts/capabilities.v1"})
+        content = result["result"]["contents"][0]
+        payload = yaml.safe_load(content["text"])
+        self.assertEqual(content["mimeType"], "application/yaml")
+        self.assertEqual(payload["schema_version"], 1)
+        self.assertEqual(payload["id"], "kvm-control.capabilities.v1")
+        self.assertIn("feature_request", [category["name"] for category in payload["classification"]["categories"]])
+        self.assertIn("repository-onboarding.v1", [workflow["id"] for workflow in payload["workflows"]])
+        self.assertIn("agent-vm-lifecycle.v1", [workflow["id"] for workflow in payload["workflows"]])
+
+    def test_read_workflow_contract_resources(self) -> None:
+        for uri, expected_id in [
+            ("kvm-control://contracts/workflows/repository-onboarding.v1", "repository-onboarding.v1"),
+            ("kvm-control://contracts/workflows/agent-vm-lifecycle.v1", "agent-vm-lifecycle.v1"),
+            ("kvm-control://contracts/workflows/namespace-lock-leases.v1", "namespace-lock-leases.v1"),
+            ("kvm-control://contracts/workflows/trash-cleanup.v1", "trash-cleanup.v1"),
+        ]:
+            with self.subTest(uri=uri):
+                result = self.rpc("resources/read", {"uri": uri})
+                content = result["result"]["contents"][0]
+                payload = yaml.safe_load(content["text"])
+                self.assertEqual(content["mimeType"], "application/yaml")
+                self.assertEqual(payload["schema_version"], 1)
+                self.assertEqual(payload["id"], expected_id)
+                self.assertIn("bug_indicators", payload)
+                self.assertIn("feature_request_indicators", payload)
+                self.assertIn("documentation_gap_indicators", payload)
+
+    def test_read_workflow_contract_schema_resource(self) -> None:
+        result = self.rpc("resources/read", {"uri": "kvm-control://contracts/workflow-contract.schema.v1"})
+        content = result["result"]["contents"][0]
+        payload = yaml.safe_load(content["text"])
+        self.assertEqual(content["mimeType"], "application/yaml")
+        self.assertEqual(payload["$schema"], "https://json-schema.org/draft/2020-12/schema")
+        self.assertIn("bug_indicators", payload["required"])
+        self.assertIn("feature_request_indicators", payload["required"])
+
     def test_read_webroot_artifacts_resource(self) -> None:
         result = self.rpc("resources/read", {"uri": "kvm-control://concepts/webroot-artifacts"})
         text = result["result"]["contents"][0]["text"]
@@ -479,18 +575,19 @@ class McpApiTests(unittest.TestCase):
         payload = json.loads(result["result"]["contents"][0]["text"])
         self.assertEqual(payload["capacity"]["max_vms"], 4)
         self.assertEqual(payload["templates"][0]["template_id"], "devuan-daedalus")
-        self.assertEqual(payload["firewall_egress_rules"][0]["target_cidr"], "198.51.100.42")
+        self.assertEqual(payload["firewall_egress_rules"][0]["target_cidr"], "192.0.2.42")
         self.assertEqual(payload["firewall_access_rules"][0]["target_zone"], "dev")
         self.assertEqual(payload["endpoint_workarounds"][0]["workaround_type"], "hosts_entry")
 
     def test_lock_tools_forward_to_lock_api(self) -> None:
-        created = self.rpc("tools/call", {"name": "request_lock", "arguments": {"namespace": "repo-a", "resource_id": "lab-a"}})
+        created = self.rpc("tools/call", {"name": "request_lock", "arguments": {"namespace": "repo-a", "resource_id": "lab-a", "lease_ttl_seconds": 86400}})
         self.assertEqual(created["result"]["structuredContent"]["status"], "granted")
         released = self.rpc("tools/call", {"name": "release_lock", "arguments": {"request_id": 1, "released_by": "repo-a"}})
         self.assertEqual(released["result"]["structuredContent"]["status"], "released")
-        refreshed = self.rpc("tools/call", {"name": "refresh_lease", "arguments": {"request_id": 1}})
+        refreshed = self.rpc("tools/call", {"name": "refresh_lease", "arguments": {"request_id": 1, "lease_ttl_seconds": 172800}})
         self.assertEqual(refreshed["result"]["structuredContent"]["lease_expires_at"], "2030-01-01 00:00:00")
-        self.assertIn(("post_lock", "/v1/locks/requests/1/lease/refresh", None), self.fake.calls)
+        self.assertIn(("post_lock", "/v1/locks/requests", {"namespace": "repo-a", "resource_id": "lab-a", "lease_ttl_seconds": 86400}), self.fake.calls)
+        self.assertIn(("post_lock", "/v1/locks/requests/1/lease/refresh", {"lease_ttl_seconds": 172800}), self.fake.calls)
 
     def test_inbound_authorization_header_is_forwarded_to_upstream_apis(self) -> None:
         class Response:

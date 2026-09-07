@@ -1,0 +1,89 @@
+schema_version: 1
+id: repository-onboarding.v1
+status: implemented
+summary: >
+  A repository-scoped agent obtains and uses a kvm-control bearer token stored
+  visibly at the repository root as repo.auth.token.
+classification:
+  purpose: >
+    Distinguish broken repository onboarding from requests for new identity or
+    token-management behavior.
+  default_rule: >
+    Treat failures in the documented self-registration flow as bugs when a
+    valid self-registration key exists and the repository has no active token.
+    Treat alternate identity stores, hidden token locations, or duplicate-token
+    replacement by non-admins as feature requests or policy rejections.
+  categories:
+    - name: bug
+      meaning: The implemented onboarding path fails despite valid inputs and satisfied preconditions.
+    - name: feature_request
+      meaning: The report asks for a token source, rotation rule, identity model, or onboarding channel not listed here.
+    - name: documentation_gap
+      meaning: The report shows an implemented onboarding behavior that is missing or ambiguous in MCP/docs.
+    - name: policy_rejection
+      meaning: The request is rejected because the repository already has an active token or the presented key is not allowed.
+actors:
+  - repository-agent
+  - control-api
+  - mcp-api
+  - admin
+auth:
+  token_file: ./repo.auth.token
+  token_file_git_policy: ignored
+  token_header: "Authorization: Bearer <token>"
+  self_registration_key_file: ~/.kvm-control-self-register.key
+  self_registration_key_kind: repository-self-registration
+  repository_token_username_prefix: git.
+preconditions:
+  - level: MUST
+    text: The repository token file is named repo.auth.token at the repository root.
+  - level: MUST
+    text: The token file contains the bearer token on the first non-empty, non-comment line.
+  - level: MUST
+    text: Self-registration requires a valid key from ~/.kvm-control-self-register.key.
+  - level: MUST
+    text: A repository name with an active token cannot self-register another token.
+  - level: SHOULD
+    text: repo.auth.token is listed in .gitignore and is not committed.
+steps:
+  - id: read-token
+    actor: repository-agent
+    action: Read ./repo.auth.token when present.
+    expected: The first non-comment token value is used as the MCP and HTTP bearer token.
+  - id: self-register
+    actor: repository-agent
+    action: If the token file is missing, read ~/.kvm-control-self-register.key and POST /v1/auth/repository-self-registration with the repository name.
+    expected: The control API mints one normal repository token when no active token already exists.
+  - id: write-token
+    actor: repository-agent
+    action: Write the returned token to ./repo.auth.token with a short comment.
+    expected: "Later MCP and HTTP calls use Authorization: Bearer with that token."
+success_criteria:
+  - Operational MCP tools accept the repository token for the token's namespace and allowed source address.
+  - Duplicate self-registration for a repository with an active token returns a conflict instead of replacing the token.
+  - Missing or invalid credentials produce an authentication or authorization error with onboarding guidance available from MCP resources.
+bug_indicators:
+  - A valid repo.auth.token is accepted for MCP resources but rejected for operational MCP tools under the same source scope.
+  - Self-registration succeeds for a repository that already has an active token.
+  - The documented self-registration request fails with a valid key, allowed source, and unregistered repository name.
+feature_request_indicators:
+  - The report asks for automatic token rotation by repository agents.
+  - The report asks for hidden token locations instead of ./repo.auth.token.
+  - The report asks for one token to cover multiple repository namespaces.
+documentation_gap_indicators:
+  - An unauthenticated MCP response does not point agents toward kvm-control://auth/onboarding.
+  - The token file format or self-registration key file name differs between README and MCP onboarding docs.
+related:
+  mcp_resources:
+    - kvm-control://auth/onboarding
+  mcp_tools: []
+  http_paths:
+    - POST /v1/auth/repository-self-registration
+    - POST /v1/admin/auth/repository-self-registration-keys
+    - GET /v1/admin/auth/repository-self-registration-keys
+    - POST /v1/admin/auth/repository-self-registration-keys/{key_id}/revoke
+  files:
+    - src/kvm_control/auth.py
+    - src/kvm_control/control_api.py
+    - src/kvm_control/mcp_api.py
+    - scripts/self_register_repository.py

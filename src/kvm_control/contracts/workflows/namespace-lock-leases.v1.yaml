@@ -1,0 +1,100 @@
+schema_version: 1
+id: namespace-lock-leases.v1
+status: implemented
+summary: >
+  Namespace locks carry leases that agents refresh while actively using VMs;
+  expired namespace locks trigger cleanup handling for non-live VMs in that
+  namespace.
+classification:
+  purpose: >
+    Distinguish broken lock lease handling from requests for richer scheduling,
+    fairness, or lock ownership behavior.
+  default_rule: >
+    Treat failures to create, refresh, enforce, or release documented namespace
+    lock leases as bugs when the caller is authorized and references the correct
+    lock request. Treat alternate queueing, priority, fairness, or cross-namespace
+    behavior as feature requests unless another implemented contract requires it.
+  categories:
+    - name: bug
+      meaning: A documented namespace lock lease operation fails or reports success without the expected lock state.
+    - name: feature_request
+      meaning: The report asks for scheduling or lock behavior outside strict FIFO lease-backed namespace locks.
+    - name: documentation_gap
+      meaning: The report shows lock ownership, release, refresh, or expiry behavior is not discoverable through MCP/docs/contracts.
+    - name: policy_rejection
+      meaning: The request is rejected because auth, namespace ownership, lease bounds, or lock state does not allow it.
+actors:
+  - repository-agent
+  - mcp-api
+  - lock-api
+  - control-api
+  - monitor
+auth:
+  token_header: "Authorization: Bearer <repository-token>"
+  namespace_scope: Repository tokens may operate only in their own git.<repository> namespace.
+  default_namespace_lock_resource: namespace:<namespace>
+  default_lease_ttl_seconds: 7200
+  max_namespace_lock_ttl_seconds: 604800
+preconditions:
+  - level: MUST
+    text: The caller is authorized for the namespace that owns the lock request.
+  - level: MUST
+    text: Namespace locks use resource_id namespace:<namespace>.
+  - level: MUST
+    text: release_lock identifies the numeric request_id, not the resource_id or VM ID.
+  - level: MUST
+    text: refresh_lease identifies a granted lock request by numeric request_id.
+  - level: SHOULD
+    text: Agents refresh the namespace lock lease while VMs are in active use.
+steps:
+  - id: request-lock
+    actor: repository-agent
+    action: Call request_lock with resource_id namespace:<namespace> and optional lease_ttl_seconds.
+    expected: The lock is granted immediately or queued according to FIFO order.
+  - id: refresh-lease
+    actor: repository-agent
+    action: Call refresh_lease with request_id while active work continues.
+    expected: The granted lock lease expiration is extended up to the configured maximum.
+  - id: release-lock
+    actor: repository-agent
+    action: Call release_lock with request_id and the owning namespace as released_by when protected work is done.
+    expected: The lock is released and the next queued request may be granted.
+  - id: expire-lock
+    actor: monitor
+    action: Detect an expired namespace lock lease.
+    expected: The expired lock is released and non-live VMs in that namespace are gracefully stopped together.
+success_criteria:
+  - request_lock exposes lease_ttl_seconds through MCP.
+  - refresh_lease exposes lease_ttl_seconds through MCP and HTTP.
+  - release_lock requires the owning namespace rather than the resource_id.
+  - Expired namespace locks stop non-live VMs in the namespace and do not stop live VMs.
+bug_indicators:
+  - refresh_lease reports success but does not extend lease_expires_at on a granted lock.
+  - release_lock accepts a resource_id as released_by instead of the owning namespace.
+  - Expired namespace locks leave non-live VMs running after the monitor processes expiry.
+  - A repository token refreshes or releases another namespace's lock request.
+feature_request_indicators:
+  - The report asks for priority queues, weighted fairness, or bypassing strict FIFO lock order.
+  - The report asks for one lock request to cover multiple namespaces.
+  - The report asks for unlimited lease TTLs beyond the configured maximum.
+  - The report asks for live VMs to be stopped automatically on namespace lock expiry.
+documentation_gap_indicators:
+  - The agent cannot discover that release_lock uses request_id and released_by namespace.
+  - The agent cannot discover the default or maximum namespace lock lease duration.
+  - README, MCP tool descriptions, and this workflow disagree on namespace lock expiry behavior.
+related:
+  mcp_resources:
+    - kvm-control://concepts/agent-workflow
+  mcp_tools:
+    - request_lock
+    - refresh_lease
+    - release_lock
+  http_paths:
+    - POST /v1/locks/requests
+    - POST /v1/locks/requests/{request_id}/lease/refresh
+    - POST /v1/locks/requests/{request_id}/release
+  files:
+    - src/kvm_control/lock_api.py
+    - src/kvm_control/control_api.py
+    - src/kvm_control/db.py
+    - src/kvm_control/monitor.py

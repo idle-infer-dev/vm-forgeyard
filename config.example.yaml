@@ -107,10 +107,18 @@ storage:
   requests_dir: ./run/kvm-control/requests
   runtime_dir: ./run/kvm-control/runtime
   audit_log: ./var/lib/kvm-control/state/audit.log
+cleanup:
+  stopped_ephemeral_vm_ttl_seconds: 86400
+  stopped_ephemeral_vm_cleanup_interval_seconds: 10800
+  trash_file_ttl_seconds: 86400
+  trash_file_cleanup_interval_seconds: 10800
 auth:
   # Bootstrap only the admin token here; onboard dev/repository tokens with:
   # POST /v1/admin/auth/tokens {"username": "dev"}
   # POST /v1/admin/auth/tokens {"username": "git.repo-name"}
+  # Or let agents self-register repository tokens after an admin creates a
+  # repository self-registration key with:
+  # POST /v1/admin/auth/repository-self-registration-keys {"name": "local-repositories"}
   admin_token:
   admin_token_hash:
   trusted_proxy_cidrs: []

@@ -1,0 +1,18 @@
+__pycache__/
+**/__pycache__/
+*.py[cod]
+.pytest_cache/
+
+*.egg-info/
+
+run/
+var/
+.venv
+.teamwork/
+HANDOFF.md
+.gitignore
+# Local credentials and deployment overrides.
+repo.auth.token
+*.token
+*.secret
+*.local.ini

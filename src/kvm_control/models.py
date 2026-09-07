@@ -48,6 +48,7 @@ class CreateVmRequest(BaseModel):
     agent_label: str | None = Field(default=None, pattern=r"^[A-Za-z0-9._:-]+$")
     handoff: str | None = None
     ssh_public_key: str | None = Field(default=None, max_length=4096)
+    nested_virtualization: bool = False
 
 
 class ResizeLayer3Request(BaseModel):
@@ -70,6 +71,9 @@ class WaitVmReadyResponse(BaseModel):
     readiness_state: ReadinessState
     reserved_ip: str
     ssh_target: str
+    readiness_probe: str = "root_ssh_command"
+    ssh_login_verified: bool = False
+    scp_verified: bool = False
     current_ip: str | None = None
     reason: str | None = None
 
@@ -100,6 +104,7 @@ class VmActionResponse(BaseModel):
     agent_session_id: str | None = None
     agent_label: str | None = None
     handoff: str | None = None
+    nested_virtualization: bool = False
 
 
 class ResizeLayer3Response(BaseModel):
@@ -503,6 +508,11 @@ class RunReportResponse(BaseModel):
 class CreateLockRequest(BaseModel):
     resource_id: str = Field(pattern=r"^[a-zA-Z0-9._:-]+$")
     namespace: str | None = Field(default=None, pattern=r"^[a-zA-Z0-9._-]+$")
+    lease_ttl_seconds: int | None = Field(default=None, ge=60)
+
+
+class RefreshLeaseRequest(BaseModel):
+    lease_ttl_seconds: int | None = Field(default=None, ge=60)
 
 
 class ReleaseLockRequest(BaseModel):
@@ -531,6 +541,44 @@ class AuthTokenResponse(BaseModel):
     created_at: str
     last_used_at: str | None = None
     revoked_at: str | None = None
+
+
+class CreateRepositorySelfRegistrationKeyRequest(BaseModel):
+    name: str = Field(pattern=r"^[a-zA-Z0-9._:-]+$")
+    source_cidrs: list[str] = Field(default_factory=list)
+
+
+class RepositorySelfRegistrationKeyCreateResponse(BaseModel):
+    key_id: str
+    name: str
+    source_cidrs: list[str] = Field(default_factory=list)
+    key: str
+    created_at: str
+
+
+class RepositorySelfRegistrationKeyResponse(BaseModel):
+    key_id: str
+    name: str
+    source_cidrs: list[str] = Field(default_factory=list)
+    created_at: str
+    last_used_at: str | None = None
+    revoked_at: str | None = None
+
+
+class RepositorySelfRegistrationRequest(BaseModel):
+    repository: str = Field(pattern=r"^[a-zA-Z0-9._-]+$")
+    agent_session_id: str | None = Field(default=None, pattern=r"^[A-Za-z0-9._:/+=-]+$")
+
+
+class RepositorySelfRegistrationResponse(BaseModel):
+    token_id: str
+    username: str
+    role: AuthRole
+    namespace: str
+    token: str
+    token_file: str = "repo.auth.token"
+    token_file_comment: str
+    created_at: str
 
 
 class CreateRunRequest(BaseModel):

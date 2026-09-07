@@ -1,0 +1,94 @@
+schema_version: 1
+id: trash-cleanup.v1
+status: implemented
+summary: >
+  VM destructive operations move direct files into storage.trash_dir first, and
+  background cleanup physically removes stale direct trash files after the
+  configured TTL.
+classification:
+  purpose: >
+    Distinguish broken trash enforcement from requests for broader storage
+    reclamation, archival, recursive cleanup, or pressure-based policy.
+  default_rule: >
+    Treat stale direct files remaining in storage.trash_dir after a cleanup pass
+    and expired TTL as bugs. Treat recursive directory deletion, pressure-based
+    cleanup, or alternate retention policies as feature requests unless another
+    implemented contract requires them.
+  categories:
+    - name: bug
+      meaning: A direct trash file older than the configured TTL survives a cleanup pass.
+    - name: feature_request
+      meaning: The report asks for cleanup behavior outside direct-file TTL enforcement.
+    - name: documentation_gap
+      meaning: The cleanup boundary, TTL, interval, or direct-file rule is unclear or inconsistent in docs/contracts.
+    - name: policy_rejection
+      meaning: Cleanup intentionally preserved a file because it was too new, outside trash_dir, a directory, or not selected by the cleanup policy.
+actors:
+  - repository-agent
+  - control-api
+  - root-vm-exec
+  - monitor
+  - reconcile
+auth:
+  config_fields:
+    trash_file_ttl_seconds: cleanup.trash_file_ttl_seconds
+    trash_file_cleanup_interval_seconds: cleanup.trash_file_cleanup_interval_seconds
+  default_trash_file_ttl_seconds: 86400
+  default_trash_file_cleanup_interval_seconds: 10800
+preconditions:
+  - level: MUST
+    text: storage.trash_dir is configured and exists on the KVM host.
+  - level: MUST
+    text: Only direct regular files under storage.trash_dir are in scope for TTL deletion.
+  - level: MUST
+    text: A file is stale only when its age is at least cleanup.trash_file_ttl_seconds.
+  - level: SHOULD
+    text: Foreground destructive VM operations move files into trash rather than deleting them synchronously.
+steps:
+  - id: move-to-trash
+    actor: root-vm-exec
+    action: Move a discarded layer file into storage.trash_dir during delete, revert, or cleanup.
+    expected: The foreground operation completes without waiting for slow physical deletion.
+  - id: monitor-cleanup
+    actor: monitor
+    action: Periodically run trash cleanup according to cleanup.trash_file_cleanup_interval_seconds.
+    expected: Direct regular files older than cleanup.trash_file_ttl_seconds are removed.
+  - id: startup-cleanup
+    actor: reconcile
+    action: Run stale trash cleanup during startup reconciliation.
+    expected: Stale direct trash files left from earlier operations or host restarts are removed.
+success_criteria:
+  - root-vm-exec exposes a cleanup-trash action.
+  - Monitor and startup reconcile run stale trash cleanup.
+  - Direct regular files older than cleanup.trash_file_ttl_seconds are deleted after cleanup.
+  - Newer direct trash files are preserved until their TTL expires.
+  - Directories under storage.trash_dir are not recursively deleted by the first implementation.
+bug_indicators:
+  - The cleanup worker leaves direct trash files older than cleanup.trash_file_ttl_seconds in place after a cleanup pass.
+  - Startup reconciliation does not remove stale direct trash files.
+  - cleanup-trash deletes direct regular files younger than cleanup.trash_file_ttl_seconds.
+  - VM delete or revert blocks on slow physical deletion instead of moving the file to trash first.
+feature_request_indicators:
+  - The report asks for recursive deletion of directories under storage.trash_dir.
+  - The report asks for cleanup based on disk pressure rather than configured file age.
+  - The report asks for archival of trashed images before deletion.
+  - The report asks for per-namespace trash TTL policy.
+documentation_gap_indicators:
+  - The agent cannot discover the configured trash TTL or cleanup interval.
+  - README, config example, and this workflow disagree on direct-file trash cleanup behavior.
+  - The docs imply recursive trash cleanup while the implementation only handles direct regular files.
+related:
+  mcp_resources:
+    - kvm-control://concepts/agent-workflow
+  mcp_tools:
+    - delete_vm
+    - wait_for_vm_ready
+  http_paths:
+    - DELETE /v1/vms/{vm_id}
+    - POST /v1/vms/{vm_id}/revert
+  files:
+    - src/kvm_control/vm_cleanup.py
+    - src/kvm_control/root_vm_exec.py
+    - src/kvm_control/monitor.py
+    - src/kvm_control/reconcile.py
+    - src/kvm_control/config.py

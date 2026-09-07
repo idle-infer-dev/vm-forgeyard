@@ -27,6 +27,7 @@ REQUIRED_TOOLS = {
     "list_endpoint_workarounds",
     "create_endpoint_workaround",
     "delete_endpoint_workaround",
+    "draft_contract_report",
 }
 
 
@@ -65,6 +66,7 @@ def main() -> int:
     missing = sorted(REQUIRED_TOOLS - set(tools))
     if missing:
         raise RuntimeError(f"missing required tools: {', '.join(missing)}")
+    rpc(args.url, "tools/call", {"name": "get_capacity", "arguments": {}}, token, 6)
 
     order_schema = tools["order_vm"]["inputSchema"]
     wait_schema = tools["wait_for_vm_ready"]["inputSchema"]
@@ -81,10 +83,16 @@ def main() -> int:
     resource_uris = {resource["uri"] for resource in resources}
     if "kvm-control://concepts/agent-workflow" not in resource_uris:
         raise RuntimeError("agent workflow resource is missing")
+    if "kvm-control://auth/onboarding" not in resource_uris:
+        raise RuntimeError("auth onboarding resource is missing")
     if "kvm-control://concepts/webroot-artifacts" not in resource_uris:
         raise RuntimeError("webroot artifacts resource is missing")
     if "kvm-control://concepts/endpoint-workarounds" not in resource_uris:
         raise RuntimeError("endpoint workarounds resource is missing")
+    if "kvm-control://contracts/capabilities.v1" not in resource_uris:
+        raise RuntimeError("capability contract resource is missing")
+    if "kvm-control://contracts/workflows/agent-vm-lifecycle.v1" not in resource_uris:
+        raise RuntimeError("agent VM lifecycle contract resource is missing")
     workflow = rpc(args.url, "resources/read", {"uri": "kvm-control://concepts/agent-workflow"}, token, 3)
     workflow_text = workflow["contents"][0]["text"]
     for phrase in (
@@ -94,11 +102,23 @@ def main() -> int:
         "ssh_public_key",
         "wait_for_vm_ready",
         "root@reserved_ip",
+        "non-interactive root SSH command",
+        "SCP",
         "PUT /v1/webroot-artifacts/{namespace}/{path}",
         "refresh_lease",
     ):
         if phrase not in workflow_text:
             raise RuntimeError(f"agent workflow resource does not mention {phrase}")
+    onboarding = rpc(args.url, "resources/read", {"uri": "kvm-control://auth/onboarding"}, token, 7)
+    onboarding_text = onboarding["contents"][0]["text"]
+    for phrase in (
+        "Authorization: Bearer",
+        "./repo.auth.token",
+        "~/.kvm-control-self-register.key",
+        "/v1/auth/repository-self-registration",
+    ):
+        if phrase not in onboarding_text:
+            raise RuntimeError(f"auth onboarding resource does not mention {phrase}")
     webroot = rpc(args.url, "resources/read", {"uri": "kvm-control://concepts/webroot-artifacts"}, token, 4)
     webroot_text = webroot["contents"][0]["text"]
     for phrase in ("raw file bytes", "GET /v1/webroot-artifacts/{namespace}", "DELETE /v1/webroot-artifacts/{namespace}/{path}", "/{namespace}/{path}"):
@@ -109,6 +129,32 @@ def main() -> int:
     for phrase in ("/etc/hosts", "dnat", "target_ip", "namespace lock"):
         if phrase not in endpoint_text:
             raise RuntimeError(f"endpoint workarounds resource does not mention {phrase}")
+    capabilities = rpc(args.url, "resources/read", {"uri": "kvm-control://contracts/capabilities.v1"}, token, 8)
+    capabilities_text = capabilities["contents"][0]["text"]
+    for phrase in ("feature_request", "documentation_gap", "repository-onboarding.v1", "agent-vm-lifecycle.v1", "namespace-lock-leases.v1", "trash-cleanup.v1"):
+        if phrase not in capabilities_text:
+            raise RuntimeError(f"capability contract resource does not mention {phrase}")
+    lifecycle_contract = rpc(args.url, "resources/read", {"uri": "kvm-control://contracts/workflows/agent-vm-lifecycle.v1"}, token, 9)
+    lifecycle_text = lifecycle_contract["contents"][0]["text"]
+    for phrase in ("bug_indicators", "feature_request_indicators", "wait_for_vm_ready", "root_ssh_command", "SCP transfer"):
+        if phrase not in lifecycle_text:
+            raise RuntimeError(f"agent VM lifecycle contract resource does not mention {phrase}")
+    drafted = rpc(
+        args.url,
+        "tools/call",
+        {
+            "name": "draft_contract_report",
+            "arguments": {
+                "workflow_id": "agent-vm-lifecycle.v1",
+                "observed": "get_capacity returns 403 through MCP but direct HTTP accepts the same token from the same source",
+                "expected": "Operational MCP tools should authorize like direct HTTP for the same effective source.",
+            },
+        },
+        token,
+        10,
+    )
+    if drafted["structuredContent"]["classification"] != "bug":
+        raise RuntimeError("draft_contract_report did not classify the operational MCP auth complaint as a bug")
 
     print(json.dumps({"ok": True, "tool_count": len(tools), "checked_url": args.url}, sort_keys=True))
     return 0

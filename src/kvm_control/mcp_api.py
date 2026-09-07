@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import importlib.resources
 import json
 import os
 from dataclasses import dataclass
@@ -11,6 +12,8 @@ from urllib.request import Request, urlopen
 
 from fastapi import FastAPI, Request as FastAPIRequest
 from fastapi.responses import JSONResponse, StreamingResponse
+
+from kvm_control.contracts.reporting import ContractReportInput, draft_contract_report, render_markdown_report
 
 
 MCP_PROTOCOL_VERSION = "2025-06-18"
@@ -24,9 +27,8 @@ kvm-control uses a three-layer disk model:
 - layer2: reusable namespace/template qcow2 images. These are active shared layers used to avoid rebuilding setup state.
 - layer3: per-VM writable qcow2 overlays. These are the disposable or retained runtime state for a single ordered VM.
 
-A typical deployment keeps imported base images and retained catalog blobs under
-reference storage, while active writable layer2/layer3 state lives under durable
-host-local VM storage.
+A typical deployment keeps imported base images and retained catalog blobs on durable reference
+storage, while active writable layer2/layer3 state lives on a separate runtime storage tree.
 
 Testsuite dependency documents link testsuite identity/version to retained image IDs and artifact-server
 objects. The dependency document owns the testsuite-to-image/artifact relationship; image lifecycle remains
@@ -61,8 +63,11 @@ layer3 during guest bootstrap. If `ssh_public_key` is omitted, access depends on
 already present in the image and the requesting agent may not have the matching private key.
 
 The target bootstrap flow is owned by kvm-control: boot on DHCP, apply host-required patches, run
-the caller's update bundle, configure the reserved static IP inside the guest, verify reserved-IP
-SSH reachability, and only then mark the VM ready.
+the caller's update bundle, configure the reserved static IP inside the guest, verify a
+non-interactive root SSH command against the reserved IP from the host-side executor, and only then
+mark the VM ready. This readiness signal does not separately prove SCP transfer or SFTP subsystem
+availability. Persistent SCP failure after a successful `wait_for_vm_ready` response should be
+reported with that response attached.
 
 kvm-control installs its guest-owned maintenance as visible cron configuration under
 `/etc/cron.d/kvm-control`. Until the next accumulated base-image rebuild, kvm-control injects this
@@ -151,7 +156,8 @@ Recommended sequence:
 3. If the VM needs small guest bootstrap files, upload them through the HTTP API:
    `PUT /v1/webroot-artifacts/{namespace}/{path}`. The guest can fetch them from `/{namespace}/{path}`.
 4. Call `order_vm` with `template_id`, `vm_slot`, `agent_session_id`, and the caller's `ssh_public_key`.
-5. Call `wait_for_vm_ready` for the returned `vm_id`.
+5. Call `wait_for_vm_ready` for the returned `vm_id`; with SSH checking enabled, ready means a
+   non-interactive root SSH command against `reserved_ip` succeeded from the host-side executor.
 6. SSH to `root@reserved_ip`; this is the normal login unless the template or handoff says otherwise.
 7. Do not use `current_ip` as the normal target.
 8. Refresh the namespace lock lease with `refresh_lease` while the VM is in active use.
@@ -161,7 +167,74 @@ Recommended sequence:
 If `ssh_public_key` is omitted, SSH access depends on keys already present in the image and may fail.
 If `wait_for_vm_ready` returns `ready=false`, inspect `reason`, `power_state`, `readiness_state`,
 and `reserved_ip` before retrying or cleaning up.
+Persistent SCP failure after `wait_for_vm_ready` returned `ready=true` and `ssh_login_verified=true`
+should be reported with the wait response attached.
 """
+
+
+AUTH_ONBOARDING_TEXT = """# kvm-control MCP authentication and repository onboarding
+
+Operational MCP tools require a repository bearer token. Agents should look for the token at the
+repository root in `./repo.auth.token`, read the first non-empty line that does not start with `#`,
+and send it to this MCP endpoint as:
+
+```http
+Authorization: Bearer <token>
+```
+
+The token file is intentionally gitignored and should contain a brief comment followed by the token
+value. Repository tokens use the `git.<repository>` username and are scoped to that exact namespace.
+
+If `./repo.auth.token` is missing, an agent may self-register the repository only when the user has
+provided a repository self-registration key at `~/.kvm-control-self-register.key`. Read the first
+non-comment line from that file and call the control API:
+
+```http
+POST /v1/auth/repository-self-registration
+Authorization: Bearer <self-registration-key>
+Content-Type: application/json
+
+{"repository": "<repository-name>", "agent_session_id": "<agent-session-id>"}
+```
+
+The response contains a normal repository token. Write it to `./repo.auth.token` before using MCP
+tools. If the repository name already has an active token, registration fails; an admin must revoke
+or otherwise reset that repository token before self-registration can mint a replacement.
+"""
+
+
+CONTRACT_RESOURCES: dict[str, tuple[str, str, str]] = {
+    "kvm-control://contracts/workflow-contract.schema.v1": (
+        "workflow-contract.schema.v1.yaml",
+        "kvm-control workflow contract schema",
+        "JSON Schema for versioned kvm-control intended-feature and workflow contracts.",
+    ),
+    "kvm-control://contracts/capabilities.v1": (
+        "capabilities.v1.yaml",
+        "kvm-control capability contract index",
+        "Machine-readable support boundary for classifying bugs, feature requests, documentation gaps, and policy rejections.",
+    ),
+    "kvm-control://contracts/workflows/repository-onboarding.v1": (
+        "workflows/repository-onboarding.v1.yaml",
+        "kvm-control repository onboarding workflow contract",
+        "Machine-readable repository token and self-registration workflow contract.",
+    ),
+    "kvm-control://contracts/workflows/agent-vm-lifecycle.v1": (
+        "workflows/agent-vm-lifecycle.v1.yaml",
+        "kvm-control agent VM lifecycle workflow contract",
+        "Machine-readable agent VM order, readiness, lease, and cleanup workflow contract.",
+    ),
+    "kvm-control://contracts/workflows/namespace-lock-leases.v1": (
+        "workflows/namespace-lock-leases.v1.yaml",
+        "kvm-control namespace lock lease workflow contract",
+        "Machine-readable namespace lock request, refresh, release, and expiry workflow contract.",
+    ),
+    "kvm-control://contracts/workflows/trash-cleanup.v1": (
+        "workflows/trash-cleanup.v1.yaml",
+        "kvm-control trash cleanup workflow contract",
+        "Machine-readable trash TTL enforcement and deferred file deletion workflow contract.",
+    ),
+}
 
 
 @dataclass
@@ -382,7 +455,8 @@ def _tools(context: dict[str, Any] | None = None) -> list[dict[str, Any]]:
                 "accepts that agent's SSH key; otherwise access depends on host-default keys already "
                 "present in the image and may fail. Use layer3_size_mb when a test needs a larger root disk virtual "
                 "size from first boot. agent_session_id is required so the VM can be traced "
-                "back to the requesting agent session. By default the VM is started immediately. "
+                "back to the requesting agent session. nested_virtualization is restricted to privileged callers. "
+                "By default the VM is started immediately. "
                 "After ordering, call wait_for_vm_ready before using SSH."
             ),
             "inputSchema": {
@@ -405,6 +479,7 @@ def _tools(context: dict[str, Any] | None = None) -> list[dict[str, Any]]:
                     "agent_session_id": {"type": "string"},
                     "agent_label": {"type": "string"},
                     "handoff": {"type": "string"},
+                    "nested_virtualization": {"type": "boolean", "default": False},
                     "ssh_public_key": {
                         "type": "string",
                         "description": "Caller OpenSSH public key to append to root's authorized_keys in this VM.",
@@ -422,8 +497,10 @@ def _tools(context: dict[str, Any] | None = None) -> list[dict[str, Any]]:
             "name": "wait_for_vm_ready",
             "description": (
                 "Ask kvm-control to wait until a VM is ready for normal access. The control API owns "
-                "the readiness transition and marks the VM ready only after reserved_ip tcp/22 is reachable "
-                "when check_ssh is true. On success, use ssh_target, normally root@reserved_ip."
+                "the readiness transition and marks the VM ready only after a non-interactive root SSH "
+                "command against reserved_ip succeeds when check_ssh is true. This does not separately "
+                "verify SCP transfer or SFTP subsystem availability. On success, use ssh_target, normally "
+                "root@reserved_ip."
             ),
             "inputSchema": {
                 "type": "object",
@@ -563,6 +640,32 @@ def _tools(context: dict[str, Any] | None = None) -> list[dict[str, Any]]:
             },
         },
         {
+            "name": "draft_contract_report",
+            "description": (
+                "Draft a structured bug, feature-request, documentation-gap, or policy-rejection "
+                "report from a machine-readable kvm-control workflow contract. Use this before "
+                "filing an issue when observed behavior may be either a bug or a request for new behavior."
+            ),
+            "inputSchema": {
+                "type": "object",
+                "required": ["workflow_id", "observed"],
+                "properties": {
+                    "workflow_id": {
+                        "type": "string",
+                        "description": "Workflow contract id, for example agent-vm-lifecycle.v1.",
+                    },
+                    "observed": {"type": "string"},
+                    "expected": {"type": "string"},
+                    "preconditions_met": {"type": "boolean", "default": True},
+                    "policy_rejection": {"type": "boolean", "default": False},
+                    "docs_ambiguous": {"type": "boolean", "default": False},
+                    "outside_contract": {"type": "boolean", "default": False},
+                    "include_markdown": {"type": "boolean", "default": False},
+                },
+                "additionalProperties": False,
+            },
+        },
+        {
             "name": "list_firewall_egress_rules",
             "description": "List dynamic outbound firewall allow rules.",
             "inputSchema": _optional_namespace_schema(),
@@ -666,6 +769,7 @@ def _tools(context: dict[str, Any] | None = None) -> list[dict[str, Any]]:
                 "properties": {
                     "namespace": {"type": "string"},
                     "resource_id": {"type": "string"},
+                    "lease_ttl_seconds": {"type": "integer", "minimum": 60},
                 },
                 "additionalProperties": False,
             },
@@ -695,7 +799,10 @@ def _tools(context: dict[str, Any] | None = None) -> list[dict[str, Any]]:
             "inputSchema": {
                 "type": "object",
                 "required": ["request_id"],
-                "properties": {"request_id": {"type": "integer"}},
+                "properties": {
+                    "request_id": {"type": "integer"},
+                    "lease_ttl_seconds": {"type": "integer", "minimum": 60},
+                },
                 "additionalProperties": False,
             },
         },
@@ -729,7 +836,7 @@ def _rule_id_schema() -> dict[str, Any]:
 
 
 def _resources() -> list[dict[str, Any]]:
-    return [
+    resources = [
         {
             "uri": "kvm-control://concepts/layers",
             "name": "kvm-control layer model",
@@ -773,12 +880,28 @@ def _resources() -> list[dict[str, Any]]:
             "mimeType": "text/markdown",
         },
         {
+            "uri": "kvm-control://auth/onboarding",
+            "name": "kvm-control MCP authentication and repository onboarding",
+            "description": "Explains bearer-token use, repo.auth.token, and repository self-registration.",
+            "mimeType": "text/markdown",
+        },
+        {
             "uri": "kvm-control://status/overview",
             "name": "kvm-control live overview",
             "description": "Live templates, capacity, VMs, images, and dependency graph snapshot.",
             "mimeType": "application/json",
         },
     ]
+    resources.extend(
+        {
+            "uri": uri,
+            "name": name,
+            "description": description,
+            "mimeType": "application/yaml",
+        }
+        for uri, (_resource_path, name, description) in CONTRACT_RESOURCES.items()
+    )
+    return resources
 
 
 def _read_resource(client: KvmControlHttpClient, uri: str | None) -> dict[str, Any]:
@@ -794,6 +917,12 @@ def _read_resource(client: KvmControlHttpClient, uri: str | None) -> dict[str, A
         return {"contents": [{"uri": uri, "mimeType": "text/markdown", "text": ENDPOINT_WORKAROUND_TEXT}]}
     if uri == "kvm-control://concepts/agent-workflow":
         return {"contents": [{"uri": uri, "mimeType": "text/markdown", "text": AGENT_WORKFLOW_TEXT}]}
+    if uri == "kvm-control://auth/onboarding":
+        return {"contents": [{"uri": uri, "mimeType": "text/markdown", "text": AUTH_ONBOARDING_TEXT}]}
+    if uri in CONTRACT_RESOURCES:
+        resource_path = CONTRACT_RESOURCES[uri][0]
+        text = _read_contract_resource(resource_path)
+        return {"contents": [{"uri": uri, "mimeType": "application/yaml", "text": text}]}
     if uri == "kvm-control://environments":
         data = client.get_control("/v1/environments")
         return {"contents": [{"uri": uri, "mimeType": "application/json", "text": json.dumps(data, indent=2, sort_keys=True)}]}
@@ -812,6 +941,13 @@ def _read_resource(client: KvmControlHttpClient, uri: str | None) -> dict[str, A
         }
         return {"contents": [{"uri": uri, "mimeType": "application/json", "text": json.dumps(data, indent=2, sort_keys=True)}]}
     raise ValueError(f"unknown resource URI {uri!r}")
+
+
+def _read_contract_resource(resource_path: str) -> str:
+    resource = importlib.resources.files("kvm_control.contracts")
+    for part in resource_path.split("/"):
+        resource = resource.joinpath(part)
+    return resource.read_text(encoding="utf-8")
 
 
 def _call_tool(client: KvmControlHttpClient, name: str | None, arguments: dict[str, Any]) -> dict[str, Any]:
@@ -891,6 +1027,20 @@ def _call_tool(client: KvmControlHttpClient, name: str | None, arguments: dict[s
                 "artifact_id": arguments.get("artifact_id"),
             },
         )
+    elif name == "draft_contract_report":
+        data = draft_contract_report(
+            ContractReportInput(
+                workflow_id=arguments["workflow_id"],
+                observed=arguments["observed"],
+                expected=arguments.get("expected") or "",
+                preconditions_met=arguments.get("preconditions_met", True),
+                policy_rejection=arguments.get("policy_rejection", False),
+                docs_ambiguous=arguments.get("docs_ambiguous", False),
+                outside_contract=arguments.get("outside_contract", False),
+            )
+        )
+        if arguments.get("include_markdown", False):
+            data["markdown"] = render_markdown_report(data)
     elif name == "list_firewall_egress_rules":
         data = client.get_control("/v1/firewall/egress-rules", query={"namespace": arguments.get("namespace")})
     elif name == "create_firewall_egress_rule":
@@ -920,7 +1070,10 @@ def _call_tool(client: KvmControlHttpClient, name: str | None, arguments: dict[s
             {"released_by": arguments.get("released_by")},
         )
     elif name == "refresh_lease":
-        data = client.post_lock(f"/v1/locks/requests/{arguments['request_id']}/lease/refresh")
+        payload = {}
+        if "lease_ttl_seconds" in arguments:
+            payload["lease_ttl_seconds"] = arguments["lease_ttl_seconds"]
+        data = client.post_lock(f"/v1/locks/requests/{arguments['request_id']}/lease/refresh", payload or None)
     else:
         raise ValueError(f"unknown tool {name!r}")
     return _tool_result(data)

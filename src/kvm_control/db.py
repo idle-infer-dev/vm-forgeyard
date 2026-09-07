@@ -10,7 +10,7 @@ from datetime import datetime, UTC
 from pathlib import Path
 from typing import Any
 
-from .config import AppConfig
+from .config import AppConfig, NetworkSegmentConfig
 from .status_bus import StatusEventBus
 
 
@@ -61,6 +61,8 @@ CREATE TABLE IF NOT EXISTS vm_instances (
     agent_label TEXT,
     handoff TEXT,
     ssh_public_key TEXT,
+    nested_virtualization INTEGER NOT NULL DEFAULT 0,
+    stopped_at TEXT,
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
     updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
     UNIQUE(namespace, vm_slot)
@@ -331,6 +333,15 @@ CREATE TABLE IF NOT EXISTS auth_tokens (
     last_used_at TEXT,
     revoked_at TEXT
 );
+CREATE TABLE IF NOT EXISTS repository_self_registration_keys (
+    key_id TEXT PRIMARY KEY,
+    name TEXT NOT NULL UNIQUE,
+    secret_hash TEXT NOT NULL,
+    source_cidrs_json TEXT NOT NULL DEFAULT '[]',
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    last_used_at TEXT,
+    revoked_at TEXT
+);
 """
 
 
@@ -371,6 +382,10 @@ class Registry:
                 conn.execute("ALTER TABLE vm_instances ADD COLUMN handoff TEXT")
             if "ssh_public_key" not in columns:
                 conn.execute("ALTER TABLE vm_instances ADD COLUMN ssh_public_key TEXT")
+            if "nested_virtualization" not in columns:
+                conn.execute("ALTER TABLE vm_instances ADD COLUMN nested_virtualization INTEGER NOT NULL DEFAULT 0")
+            if "stopped_at" not in columns:
+                conn.execute("ALTER TABLE vm_instances ADD COLUMN stopped_at TEXT")
             template_columns = {row["name"] for row in conn.execute("PRAGMA table_info(templates)").fetchall()}
             if "base_image_format" not in template_columns:
                 conn.execute("ALTER TABLE templates ADD COLUMN base_image_format TEXT NOT NULL DEFAULT 'qcow2'")
@@ -501,9 +516,47 @@ class Registry:
             row = conn.execute("SELECT * FROM auth_tokens WHERE token_id = ?", (token_id,)).fetchone()
         return dict(row)
 
+    def replace_revoked_auth_token(
+        self,
+        token_id: str,
+        username: str,
+        role: str,
+        namespace: str | None,
+        secret_hash: str,
+    ) -> dict[str, Any]:
+        with self.tx() as conn:
+            existing = conn.execute("SELECT * FROM auth_tokens WHERE username = ?", (username,)).fetchone()
+            if existing is None:
+                conn.execute(
+                    """
+                    INSERT INTO auth_tokens(token_id, username, role, namespace, secret_hash)
+                    VALUES(?, ?, ?, ?, ?)
+                    """,
+                    (token_id, username, role, namespace, secret_hash),
+                )
+            elif existing["revoked_at"]:
+                conn.execute(
+                    """
+                    UPDATE auth_tokens
+                    SET token_id = ?, role = ?, namespace = ?, secret_hash = ?,
+                        created_at = CURRENT_TIMESTAMP, last_used_at = NULL, revoked_at = NULL
+                    WHERE username = ?
+                    """,
+                    (token_id, role, namespace, secret_hash, username),
+                )
+            else:
+                raise ValueError("repository is already registered")
+            row = conn.execute("SELECT * FROM auth_tokens WHERE username = ?", (username,)).fetchone()
+        return dict(row)
+
     def get_auth_token(self, token_id: str) -> dict[str, Any] | None:
         with self.tx() as conn:
             row = conn.execute("SELECT * FROM auth_tokens WHERE token_id = ?", (token_id,)).fetchone()
+        return dict(row) if row else None
+
+    def get_auth_token_by_username(self, username: str) -> dict[str, Any] | None:
+        with self.tx() as conn:
+            row = conn.execute("SELECT * FROM auth_tokens WHERE username = ?", (username,)).fetchone()
         return dict(row) if row else None
 
     def list_auth_tokens(self) -> list[dict[str, Any]]:
@@ -534,11 +587,74 @@ class Registry:
             ).fetchone()
         return dict(row) if row else None
 
-    def _network_for_segment(self, network_id: str) -> ipaddress.IPv4Network:
+    def create_repository_self_registration_key(
+        self,
+        key_id: str,
+        name: str,
+        secret_hash: str,
+        source_cidrs: list[str],
+    ) -> dict[str, Any]:
+        with self.tx() as conn:
+            conn.execute(
+                """
+                INSERT INTO repository_self_registration_keys(key_id, name, secret_hash, source_cidrs_json)
+                VALUES(?, ?, ?, ?)
+                """,
+                (key_id, name, secret_hash, json.dumps(source_cidrs)),
+            )
+            row = conn.execute("SELECT * FROM repository_self_registration_keys WHERE key_id = ?", (key_id,)).fetchone()
+        return _decode_repository_self_registration_key(row)
+
+    def get_repository_self_registration_key(self, key_id: str) -> dict[str, Any] | None:
+        with self.tx() as conn:
+            row = conn.execute("SELECT * FROM repository_self_registration_keys WHERE key_id = ?", (key_id,)).fetchone()
+        return _decode_repository_self_registration_key(row) if row else None
+
+    def list_repository_self_registration_keys(self) -> list[dict[str, Any]]:
+        with self.tx() as conn:
+            rows = conn.execute(
+                """
+                SELECT key_id, name, source_cidrs_json, created_at, last_used_at, revoked_at
+                FROM repository_self_registration_keys
+                ORDER BY name
+                """
+            ).fetchall()
+        return [_decode_repository_self_registration_key(row) for row in rows]
+
+    def mark_repository_self_registration_key_used(self, key_id: str) -> None:
+        with self.tx() as conn:
+            conn.execute("UPDATE repository_self_registration_keys SET last_used_at = CURRENT_TIMESTAMP WHERE key_id = ?", (key_id,))
+
+    def revoke_repository_self_registration_key(self, key_id: str) -> dict[str, Any] | None:
+        with self.tx() as conn:
+            conn.execute(
+                """
+                UPDATE repository_self_registration_keys
+                SET revoked_at = CURRENT_TIMESTAMP
+                WHERE key_id = ? AND revoked_at IS NULL
+                """,
+                (key_id,),
+            )
+            row = conn.execute(
+                """
+                SELECT key_id, name, source_cidrs_json, created_at, last_used_at, revoked_at
+                FROM repository_self_registration_keys
+                WHERE key_id = ?
+                """,
+                (key_id,),
+            ).fetchone()
+        return _decode_repository_self_registration_key(row) if row else None
+
+    def _segment_for_network(self, network_id: str) -> NetworkSegmentConfig:
         segments = list(self.config.network.segments)
         segment = next((item for item in segments if item.id == network_id), None)
         if segment is None:
             raise ValueError(f"unknown network {network_id}")
+        return segment
+
+    def _network_for_segment(self, network_id: str) -> ipaddress.IPv4Network:
+        segments = list(self.config.network.segments)
+        segment = self._segment_for_network(network_id)
         if segment.address:
             network = ipaddress.ip_interface(segment.address).network
             if network.version != 4:
@@ -555,9 +671,22 @@ class Registry:
                 return subnets[index]
         return base
 
+    def _ip_in_dynamic_dhcp_pool(self, network_id: str, ip_address: str | ipaddress.IPv4Address) -> bool:
+        segment = self._segment_for_network(network_id)
+        if not segment.dhcp_range_start or not segment.dhcp_range_end:
+            return False
+        candidate = ipaddress.ip_address(ip_address)
+        start = ipaddress.ip_address(segment.dhcp_range_start)
+        end = ipaddress.ip_address(segment.dhcp_range_end)
+        if candidate.version != 4 or start.version != 4 or end.version != 4:
+            return False
+        if start > end:
+            start, end = end, start
+        return start <= candidate <= end
+
     def _network_hosts(self, network_id: str) -> list[str]:
         net = self._network_for_segment(network_id)
-        return [str(host) for host in net.hosts()][10:]
+        return [str(host) for host in list(net.hosts())[10:] if not self._ip_in_dynamic_dhcp_pool(network_id, host)]
 
     def reserve_ip(self, namespace: str, vm_slot: str, network_id: str) -> dict[str, str]:
         reused = False
@@ -567,7 +696,11 @@ class Registry:
                 (namespace, vm_slot),
             ).fetchone()
             reservation_network = self._network_for_segment(network_id)
-            if row and ipaddress.ip_address(row["ip_address"]) in reservation_network:
+            if (
+                row
+                and ipaddress.ip_address(row["ip_address"]) in reservation_network
+                and not self._ip_in_dynamic_dhcp_pool(network_id, row["ip_address"])
+            ):
                 reservation = {"reserved_ip": row["ip_address"], "reserved_mac": row["mac_address"]}
                 reused = True
             else:
@@ -963,6 +1096,20 @@ class Registry:
             ).fetchall()
         return [dict(row) for row in rows]
 
+    def list_stopped_ephemeral_vms(self) -> list[dict[str, Any]]:
+        with self.tx() as conn:
+            rows = conn.execute(
+                """
+                SELECT *
+                FROM vm_instances
+                WHERE retention = 'ephemeral'
+                  AND layer3_presence = 'present'
+                  AND power_state IN ('stopped', 'failed')
+                ORDER BY namespace, vm_slot
+                """,
+            ).fetchall()
+        return [dict(row) for row in rows]
+
     def upsert_vm(self, vm: dict[str, Any]) -> dict[str, Any]:
         vm = {
             "retention": "ephemeral",
@@ -972,8 +1119,12 @@ class Registry:
             "agent_label": None,
             "handoff": None,
             "ssh_public_key": None,
+            "nested_virtualization": 0,
+            "stopped_at": None,
             **vm,
         }
+        if vm["stopped_at"] is None and vm.get("power_state") in {"stopped", "failed"}:
+            vm["stopped_at"] = datetime.now(UTC).replace(tzinfo=None).isoformat(sep=" ", timespec="seconds")
         with self.tx() as conn:
             conn.execute(
                 """
@@ -981,12 +1132,12 @@ class Registry:
                     vm_id, namespace, vm_slot, template_id, network_id, vcpus, memory_mb, estimated_layer3_growth_mb,
                     reserved_ip, reserved_mac, power_state, readiness_state, status,
                     layer2_path, layer2_presence, layer3_path, layer3_presence, pause_reason, lock_resource_id, source_image_id,
-                    retention, retention_reason, purpose, agent_session_id, agent_label, handoff, ssh_public_key
+                    retention, retention_reason, purpose, agent_session_id, agent_label, handoff, ssh_public_key, nested_virtualization, stopped_at
                 ) VALUES(
                     :vm_id, :namespace, :vm_slot, :template_id, :network_id, :vcpus, :memory_mb, :estimated_layer3_growth_mb,
                     :reserved_ip, :reserved_mac, :power_state, :readiness_state, :status,
                     :layer2_path, :layer2_presence, :layer3_path, :layer3_presence, :pause_reason, :lock_resource_id, :source_image_id,
-                    :retention, :retention_reason, :purpose, :agent_session_id, :agent_label, :handoff, :ssh_public_key
+                    :retention, :retention_reason, :purpose, :agent_session_id, :agent_label, :handoff, :ssh_public_key, :nested_virtualization, :stopped_at
                 )
                 ON CONFLICT(vm_id) DO UPDATE SET
                     network_id = excluded.network_id,
@@ -1012,6 +1163,8 @@ class Registry:
                     agent_label = excluded.agent_label,
                     handoff = excluded.handoff,
                     ssh_public_key = excluded.ssh_public_key,
+                    nested_virtualization = excluded.nested_virtualization,
+                    stopped_at = excluded.stopped_at,
                     updated_at = CURRENT_TIMESTAMP
                 """,
                 vm,
@@ -1021,6 +1174,13 @@ class Registry:
     def patch_vm(self, vm_id: str, **updates: Any) -> dict[str, Any]:
         columns = ["updated_at = CURRENT_TIMESTAMP"]
         values: list[Any] = []
+        if "power_state" in updates and "stopped_at" not in updates:
+            if updates["power_state"] in {"stopped", "failed"}:
+                current = self.get_vm(vm_id)
+                if current is None or current.get("power_state") != updates["power_state"] or not current.get("stopped_at"):
+                    updates["stopped_at"] = datetime.now(UTC).replace(tzinfo=None).isoformat(sep=" ", timespec="seconds")
+            elif updates["power_state"] in {"starting", "running", "paused"}:
+                updates["stopped_at"] = None
         for key, value in updates.items():
             columns.append(f"{key} = ?")
             values.append(value)
@@ -1160,8 +1320,11 @@ class Registry:
             ).fetchone()
         return int(row["count"])
 
-    def ensure_lock_request(self, resource_id: str, namespace: str) -> dict[str, Any]:
-        ttl_seconds = self.config.leases.namespace_lock_ttl_seconds if resource_id == f"namespace:{namespace}" else None
+    def ensure_lock_request(self, resource_id: str, namespace: str, ttl_seconds: int | None = None) -> dict[str, Any]:
+        if resource_id == f"namespace:{namespace}":
+            ttl_seconds = ttl_seconds or self.config.leases.namespace_lock_ttl_seconds
+        else:
+            ttl_seconds = None
         with self.tx() as conn:
             conn.execute(
                 "INSERT INTO lock_resources(resource_id) VALUES(?) ON CONFLICT(resource_id) DO NOTHING",
@@ -2422,6 +2585,14 @@ def _status_event_row(row: sqlite3.Row | None) -> dict[str, Any] | None:
         return None
     result = dict(row)
     result["details"] = json.loads(result.pop("details_json", "{}"))
+    return result
+
+
+def _decode_repository_self_registration_key(row: sqlite3.Row | None) -> dict[str, Any]:
+    if row is None:
+        raise KeyError("repository self-registration key not found")
+    result = dict(row)
+    result["source_cidrs"] = json.loads(result.pop("source_cidrs_json", "[]"))
     return result
 
 

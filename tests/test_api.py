@@ -24,8 +24,10 @@ import starlette.concurrency
 from kvm_control.control_api import create_app as create_control_app
 from kvm_control.firewall import reconcile_firewall_access
 from kvm_control.lock_api import create_app as create_lock_app
+from kvm_control.reconcile import reconcile_registered_vm_runtime_states
 from kvm_control.service import build_services
 from kvm_control.status_bus import StatusEventBus
+from kvm_control.vm_cleanup import cleanup_stale_stopped_ephemeral_vms
 
 
 # The local sandbox can stall asyncio/anyio worker-thread portals used by
@@ -148,6 +150,36 @@ def write_config(root: Path, dry_run: bool = True) -> Path:
             "gateway": "10.90.0.1",
             "dhcp_cidr": "10.91.0.0/24",
             "mac_prefix": "52:54:00",
+            "segments": [
+                {
+                    "id": "dev",
+                    "bridge": "dev",
+                    "address": "10.90.1.1/24",
+                    "dhcp_range_start": "10.90.1.100",
+                    "dhcp_range_end": "10.90.1.199",
+                },
+                {
+                    "id": "stage",
+                    "bridge": "stage",
+                    "address": "10.90.2.1/24",
+                    "dhcp_range_start": "10.90.2.100",
+                    "dhcp_range_end": "10.90.2.199",
+                },
+                {
+                    "id": "misc",
+                    "bridge": "misc",
+                    "address": "10.90.3.1/24",
+                    "dhcp_range_start": "10.90.3.100",
+                    "dhcp_range_end": "10.90.3.199",
+                },
+                {
+                    "id": "live",
+                    "bridge": "live",
+                    "address": "10.90.4.1/24",
+                    "dhcp_range_start": "10.90.4.100",
+                    "dhcp_range_end": "10.90.4.199",
+                },
+            ],
         },
         "storage": {
             "base_dir": str(base_dir),
@@ -222,6 +254,7 @@ class ApiTests(unittest.TestCase):
                 "agent_label": "codex",
                 "handoff": "retain state if lifecycle test fails",
                 "ssh_public_key": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAITestKey codex-test",
+                "nested_virtualization": True,
             },
         )
         self.assertEqual(create.status_code, 202)
@@ -231,7 +264,9 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(create.json()["retention"], "keep_stopped")
         self.assertEqual(create.json()["purpose"], "exercise vm lifecycle")
         self.assertEqual(create.json()["agent_session_id"], "codex-test-session")
+        self.assertTrue(create.json()["nested_virtualization"])
         self.assertEqual(self.services.registry.get_vm(vm_id)["ssh_public_key"], "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAITestKey codex-test")
+        self.assertEqual(self.services.registry.get_vm(vm_id)["nested_virtualization"], 1)
 
         vm = self.control.get(f"/v1/vms/{vm_id}")
         self.assertEqual(vm.status_code, 200)
@@ -239,6 +274,7 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(vm.json()["readiness_state"], "booting")
         self.assertEqual(vm.json()["reserved_ip"], reserved_ip)
         self.assertEqual(vm.json()["retention"], "keep_stopped")
+        self.assertTrue(vm.json()["nested_virtualization"])
 
         retention = self.control.post(
             f"/v1/vms/{vm_id}/retention",
@@ -281,6 +317,32 @@ class ApiTests(unittest.TestCase):
             self.assertEqual(create.status_code, 202)
             self.assertTrue(create.json()["reserved_ip"].startswith(expected_prefix))
 
+    def test_reserved_ip_skips_configured_dhcp_pool(self) -> None:
+        reservations = [
+            self.services.registry.reserve_ip("repo-dhcp", f"node-{index}", "dev")
+            for index in range(90)
+        ]
+        self.assertEqual(reservations[0]["reserved_ip"], "10.90.1.11")
+        self.assertEqual(reservations[88]["reserved_ip"], "10.90.1.99")
+        self.assertEqual(reservations[89]["reserved_ip"], "10.90.1.200")
+        self.assertFalse(any(reservation["reserved_ip"].startswith("10.90.1.1") for reservation in reservations[89:]))
+        self.assertNotIn("10.90.1.120", {reservation["reserved_ip"] for reservation in reservations})
+
+    def test_existing_reserved_ip_in_dhcp_pool_is_reallocated(self) -> None:
+        with self.services.registry.tx() as conn:
+            conn.execute(
+                """
+                INSERT INTO ip_reservations(namespace, vm_slot, ip_address, mac_address)
+                VALUES(?, ?, ?, ?)
+                """,
+                ("repo-dhcp", "node-stale", "10.90.1.120", "52:54:00:00:00:20"),
+            )
+
+        reservation = self.services.registry.reserve_ip("repo-dhcp", "node-stale", "dev")
+
+        self.assertEqual(reservation["reserved_ip"], "10.90.1.11")
+        self.assertEqual(reservation["reserved_mac"], "52:54:00:00:00:20")
+
     def test_vm_mark_ready_is_disabled_for_api_owned_readiness(self) -> None:
         create = self.control.post(
             "/v1/vms",
@@ -319,7 +381,11 @@ class ApiTests(unittest.TestCase):
         vm_id = create.json()["vm_id"]
         reserved_ip = create.json()["reserved_ip"]
 
-        with patch("kvm_control.control_api._tcp_port_open", return_value=False):
+        with patch.object(
+            self.services.executor,
+            "run",
+            return_value={"result": "not-ready", "readiness_probe": "root_ssh_command", "ssh_login_verified": False, "error": "connection refused"},
+        ):
             timed_out = self.control.post(
                 f"/v1/vms/{vm_id}/wait-ready",
                 json={"timeout_s": 0, "poll_interval_s": 1},
@@ -328,18 +394,42 @@ class ApiTests(unittest.TestCase):
         self.assertFalse(timed_out.json()["ready"])
         self.assertTrue(timed_out.json()["timed_out"])
         self.assertEqual(timed_out.json()["ssh_target"], f"root@{reserved_ip}")
-        self.assertIn("reserved_ip", timed_out.json()["reason"])
+        self.assertIn("root SSH login", timed_out.json()["reason"])
+        self.assertIn("connection refused", timed_out.json()["reason"])
 
-        with patch("kvm_control.control_api._tcp_port_open", return_value=True):
+        with patch.object(
+            self.services.executor,
+            "run",
+            return_value={"result": "ok", "readiness_probe": "root_ssh_command", "ssh_login_verified": True, "scp_verified": False},
+        ) as wait_ssh:
             ready = self.control.post(
                 f"/v1/vms/{vm_id}/wait-ready",
                 json={"timeout_s": 1, "poll_interval_s": 1},
             )
+        wait_ssh.assert_called()
         self.assertEqual(ready.status_code, 200)
         self.assertTrue(ready.json()["ready"])
         self.assertFalse(ready.json()["timed_out"])
         self.assertEqual(ready.json()["readiness_state"], "ready")
         self.assertEqual(ready.json()["ssh_target"], f"root@{reserved_ip}")
+        self.assertEqual(ready.json()["readiness_probe"], "root_ssh_command")
+        self.assertTrue(ready.json()["ssh_login_verified"])
+        self.assertFalse(ready.json()["scp_verified"])
+
+        with patch.object(
+            self.services.executor,
+            "run",
+            return_value={"result": "not-ready", "readiness_probe": "root_ssh_command", "ssh_login_verified": False, "error": "connection refused"},
+        ) as cached_ready_wait_ssh:
+            cached_ready_probe = self.control.post(
+                f"/v1/vms/{vm_id}/wait-ready",
+                json={"timeout_s": 0, "poll_interval_s": 1},
+            )
+        cached_ready_wait_ssh.assert_called()
+        self.assertEqual(cached_ready_probe.status_code, 200)
+        self.assertFalse(cached_ready_probe.json()["ready"])
+        self.assertTrue(cached_ready_probe.json()["timed_out"])
+        self.assertIn("root SSH login", cached_ready_probe.json()["reason"])
 
         already_ready = self.control.post(
             f"/v1/vms/{vm_id}/wait-ready",
@@ -610,6 +700,16 @@ class ApiTests(unittest.TestCase):
         )
         self.assertEqual([recipe["id"] for recipe in agent_layer2.json()], ["agent-sandbox-tools-ubuntu-24.04-noble-amd64"])
         self.assertEqual(agent_layer2.json()[0]["default_access"], "user-only")
+        self.assertIn("dnsmasq", agent_layer2.json()[0]["system_packages"])
+        self.assertIn("nfs-common", agent_layer2.json()[0]["system_packages"])
+        self.assertIn("python3-fastapi", agent_layer2.json()[0]["system_packages"])
+        self.assertIn("python3-pydantic", agent_layer2.json()[0]["system_packages"])
+        self.assertIn("python3-uvicorn", agent_layer2.json()[0]["system_packages"])
+        self.assertIn("python3-yaml", agent_layer2.json()[0]["system_packages"])
+        self.assertIn("libvirt-clients", agent_layer2.json()[0]["system_packages"])
+        self.assertIn("libvirt-daemon-system", agent_layer2.json()[0]["system_packages"])
+        self.assertIn("qemu-system-x86", agent_layer2.json()[0]["system_packages"])
+        self.assertIn("qemu-utils", agent_layer2.json()[0]["system_packages"])
         browser_layer2 = self.control.get(
             "/v1/layer2-image-recipes",
             params={"keyword": "playwright"},
@@ -1028,7 +1128,7 @@ class ApiTests(unittest.TestCase):
                     "namespace": "repo-a",
                     "lock_resource_id": "namespace:repo-a",
                     "target_zone": target_zone,
-                    "source_cidr": "198.51.100.42",
+                    "source_cidr": "192.0.2.42",
                 },
             )
             self.assertEqual(response.status_code, 201)
@@ -1070,7 +1170,7 @@ class ApiTests(unittest.TestCase):
                 "namespace": "repo-a",
                 "lock_resource_id": "namespace:repo-a",
                 "target_zone": "dev",
-                "source_cidr": "198.51.100.42",
+                "source_cidr": "192.0.2.42",
             },
         )
         second_rule = self.control.post(
@@ -1079,17 +1179,17 @@ class ApiTests(unittest.TestCase):
                 "namespace": "repo-b",
                 "lock_resource_id": "namespace:repo-b",
                 "target_zone": "dev",
-                "source_cidr": "198.51.100.42/32",
+                "source_cidr": "192.0.2.42/32",
             },
         )
         self.assertEqual(first_rule.status_code, 201)
         self.assertEqual(second_rule.status_code, 201)
-        self.assertEqual(second_rule.json()["source_cidr"], "198.51.100.42")
-        self.assertEqual(self.services.registry.effective_firewall_access_entries()["dev"], ["198.51.100.42"])
+        self.assertEqual(second_rule.json()["source_cidr"], "192.0.2.42")
+        self.assertEqual(self.services.registry.effective_firewall_access_entries()["dev"], ["192.0.2.42"])
 
         release_first = self.lock.post(f"/v1/locks/requests/{first_lock.json()['id']}/release", json={"released_by": "repo-a"})
         self.assertEqual(release_first.status_code, 200)
-        self.assertEqual(self.services.registry.effective_firewall_access_entries()["dev"], ["198.51.100.42"])
+        self.assertEqual(self.services.registry.effective_firewall_access_entries()["dev"], ["192.0.2.42"])
         listed_second = self.control.get("/v1/firewall/access-rules?namespace=repo-b")
         self.assertEqual(len(listed_second.json()), 1)
 
@@ -1107,11 +1207,11 @@ class ApiTests(unittest.TestCase):
                 "namespace": "repo-a",
                 "lock_resource_id": "namespace:repo-a",
                 "target_zone": "stage",
-                "source_cidr": "198.51.100.0/24",
+                "source_cidr": "192.0.2.0/24",
             },
         )
         self.assertEqual(cidr.status_code, 201)
-        self.assertEqual(cidr.json()["source_cidr"], "198.51.100.0/24")
+        self.assertEqual(cidr.json()["source_cidr"], "192.0.2.0/24")
 
         invalid = self.control.post(
             "/v1/firewall/access-rules",
@@ -1119,7 +1219,7 @@ class ApiTests(unittest.TestCase):
                 "namespace": "repo-a",
                 "lock_resource_id": "namespace:repo-a",
                 "target_zone": "stage",
-                "source_cidr": "198.51.100.999/24",
+                "source_cidr": "192.0.2.999/24",
             },
         )
         self.assertEqual(invalid.status_code, 422)
@@ -1156,7 +1256,7 @@ class ApiTests(unittest.TestCase):
                 "namespace": "repo-a",
                 "lock_resource_id": "namespace:repo-a",
                 "mode": "cidr",
-                "target_cidr": "198.51.100.42",
+                "target_cidr": "192.0.2.42",
             },
         )
         self.assertEqual(allow_ip.status_code, 201)
@@ -1164,12 +1264,12 @@ class ApiTests(unittest.TestCase):
         listed = self.control.get("/v1/firewall/egress-rules?namespace=repo-a")
         self.assertEqual(listed.status_code, 200)
         self.assertEqual([row["mode"] for row in listed.json()], ["allow_all", "cidr"])
-        self.assertEqual(listed.json()[1]["target_cidr"], "198.51.100.42")
-        self.assertEqual(self.services.registry.effective_firewall_egress_entries(), ["0.0.0.0/1", "128.0.0.0/1", "198.51.100.42"])
+        self.assertEqual(listed.json()[1]["target_cidr"], "192.0.2.42")
+        self.assertEqual(self.services.registry.effective_firewall_egress_entries(), ["0.0.0.0/1", "128.0.0.0/1", "192.0.2.42"])
 
         deleted = self.control.delete(f"/v1/firewall/egress-rules/{allow_all.json()['id']}")
         self.assertEqual(deleted.status_code, 200)
-        self.assertEqual(self.services.registry.effective_firewall_egress_entries(), ["198.51.100.42"])
+        self.assertEqual(self.services.registry.effective_firewall_egress_entries(), ["192.0.2.42"])
 
         release = self.lock.post(f"/v1/locks/requests/{lock.json()['id']}/release", json={"released_by": "repo-a"})
         self.assertEqual(release.status_code, 200)
@@ -1189,12 +1289,12 @@ class ApiTests(unittest.TestCase):
                 "namespace": "repo-a",
                 "lock_resource_id": "namespace:repo-a",
                 "mode": "cidr",
-                "target_cidr": "198.51.100.0/24",
+                "target_cidr": "192.0.2.0/24",
             },
         )
         self.assertEqual(cidr.status_code, 201)
         self.assertEqual(cidr.json()["mode"], "cidr")
-        self.assertEqual(cidr.json()["target_cidr"], "198.51.100.0/24")
+        self.assertEqual(cidr.json()["target_cidr"], "192.0.2.0/24")
 
         legacy = self.control.post(
             "/v1/firewall/egress-rules",
@@ -1202,16 +1302,16 @@ class ApiTests(unittest.TestCase):
                 "namespace": "repo-a",
                 "lock_resource_id": "namespace:repo-a",
                 "mode": "single_ip",
-                "target_ip": "198.51.100.42/32",
+                "target_ip": "192.0.2.42/32",
             },
         )
         self.assertEqual(legacy.status_code, 201)
         self.assertEqual(legacy.json()["mode"], "cidr")
-        self.assertEqual(legacy.json()["target_cidr"], "198.51.100.42")
+        self.assertEqual(legacy.json()["target_cidr"], "192.0.2.42")
 
         listed = self.control.get("/v1/firewall/egress-rules?namespace=repo-a")
         self.assertEqual(listed.status_code, 200)
-        self.assertEqual([row["target_cidr"] for row in listed.json()], ["198.51.100.0/24", "198.51.100.42"])
+        self.assertEqual([row["target_cidr"] for row in listed.json()], ["192.0.2.0/24", "192.0.2.42"])
 
     def test_firewall_egress_rules_validate_mode_and_target_cidr(self) -> None:
         lock = self.lock.post("/v1/locks/requests", json={"resource_id": "namespace:repo-a", "namespace": "repo-a"})
@@ -1233,7 +1333,7 @@ class ApiTests(unittest.TestCase):
                 "namespace": "repo-a",
                 "lock_resource_id": "namespace:repo-a",
                 "mode": "cidr",
-                "target_cidr": "198.51.100.999/24",
+                "target_cidr": "192.0.2.999/24",
             },
         )
         self.assertEqual(invalid.status_code, 422)
@@ -1255,7 +1355,7 @@ class ApiTests(unittest.TestCase):
                 "namespace": "repo-a",
                 "lock_resource_id": "namespace:repo-a",
                 "mode": "allow_all",
-                "target_cidr": "198.51.100.42",
+                "target_cidr": "192.0.2.42",
             },
         )
         self.assertEqual(reject_target_on_allow_all.status_code, 422)
@@ -1273,7 +1373,7 @@ class ApiTests(unittest.TestCase):
                 "kind": "fqdn",
                 "value": "Updates.Example.Test.",
                 "workaround_type": "hosts_entry",
-                "target_ip": "198.51.100.42",
+                "target_ip": "192.0.2.42",
                 "apply_on": ["appliance", "appliance"],
                 "maps_to_service": "update_repository",
                 "manifest_id": "appliance-smoke",
@@ -1292,7 +1392,7 @@ class ApiTests(unittest.TestCase):
                 "kind": "ip",
                 "value": "203.0.113.10",
                 "workaround_type": "dnat",
-                "target_ip": "198.51.100.43",
+                "target_ip": "192.0.2.43",
                 "apply_on": ["appliance"],
                 "maps_to_service": "payment_simulator",
             },
@@ -1322,7 +1422,7 @@ class ApiTests(unittest.TestCase):
                 "kind": "fqdn",
                 "value": "updates.example.test",
                 "workaround_type": "dnat",
-                "target_ip": "198.51.100.42",
+                "target_ip": "192.0.2.42",
                 "apply_on": ["appliance"],
             },
         )
@@ -1336,7 +1436,7 @@ class ApiTests(unittest.TestCase):
                 "kind": "ip",
                 "value": "203.0.113.10",
                 "workaround_type": "hosts_entry",
-                "target_ip": "198.51.100.42",
+                "target_ip": "192.0.2.42",
                 "apply_on": ["appliance"],
             },
         )
@@ -1350,7 +1450,7 @@ class ApiTests(unittest.TestCase):
                 "kind": "ip",
                 "value": "not-an-ip",
                 "workaround_type": "dnat",
-                "target_ip": "198.51.100.42",
+                "target_ip": "192.0.2.42",
                 "apply_on": ["appliance"],
             },
         )
@@ -1381,7 +1481,7 @@ class ApiTests(unittest.TestCase):
                 "kind": "fqdn",
                 "value": "updates.example.test",
                 "workaround_type": "hosts_entry",
-                "target_ip": "198.51.100.42",
+                "target_ip": "192.0.2.42",
                 "apply_on": ["appliance"],
                 "maps_to_service": "update_repository",
                 "constraint_id": "legacy-update-fqdn",
@@ -1414,12 +1514,12 @@ class ApiTests(unittest.TestCase):
                     "kind": "fqdn",
                     "value": "updates.example.test",
                     "workaround_type": "hosts_entry",
-                    "target_ip": "198.51.100.42",
+                    "target_ip": "192.0.2.42",
                     "apply_on": "appliance",
                     "status": "completed",
                     "observed_state": {
                         "file": "/etc/hosts",
-                        "line": "198.51.100.42 updates.example.test",
+                        "line": "192.0.2.42 updates.example.test",
                     },
                     "evidence": {"exit_code": 0},
                 },
@@ -1431,7 +1531,7 @@ class ApiTests(unittest.TestCase):
 
         events = self.control.get(f"/v1/runs/{run_id}/events")
         self.assertEqual(events.status_code, 200)
-        self.assertEqual(events.json()[0]["details"]["observed_state"]["line"], "198.51.100.42 updates.example.test")
+        self.assertEqual(events.json()[0]["details"]["observed_state"]["line"], "192.0.2.42 updates.example.test")
 
     def test_endpoint_workaround_evidence_must_match_declared_rule(self) -> None:
         lock = self.lock.post("/v1/locks/requests", json={"resource_id": "namespace:repo-a", "namespace": "repo-a"})
@@ -1444,7 +1544,7 @@ class ApiTests(unittest.TestCase):
                 "kind": "ip",
                 "value": "203.0.113.10",
                 "workaround_type": "dnat",
-                "target_ip": "198.51.100.42",
+                "target_ip": "192.0.2.42",
                 "apply_on": ["appliance"],
             },
         )
@@ -1470,7 +1570,7 @@ class ApiTests(unittest.TestCase):
                     "kind": "ip",
                     "value": "203.0.113.10",
                     "workaround_type": "dnat",
-                    "target_ip": "198.51.100.99",
+                    "target_ip": "192.0.2.99",
                     "apply_on": "appliance",
                     "status": "completed",
                 },
@@ -1648,6 +1748,43 @@ class ApiTests(unittest.TestCase):
         )
         self.assertEqual(stage_vm.status_code, 403)
 
+        nested_denied = self.control.post(
+            "/v1/vms",
+            json={
+                "template_id": "ubuntu-24.04",
+                "vm_slot": "nested-denied",
+                "network_id": "dev",
+                "autostart": False,
+                "agent_session_id": "pytest-auth-session",
+                "nested_virtualization": True,
+            },
+            headers=repo_headers,
+        )
+        self.assertEqual(nested_denied.status_code, 403)
+        self.assertEqual(nested_denied.json()["detail"], "nested virtualization denied")
+
+        kvm_control_token = self.control.post(
+            "/v1/admin/auth/tokens",
+            json={"username": "git.kvm-control"},
+            headers=admin_headers,
+        )
+        self.assertEqual(kvm_control_token.status_code, 201)
+        kvm_control_headers = {"Authorization": f"Bearer {kvm_control_token.json()['token']}"}
+        nested_allowed = self.control.post(
+            "/v1/vms",
+            json={
+                "template_id": "ubuntu-24.04",
+                "vm_slot": "nested-allowed",
+                "network_id": "dev",
+                "autostart": False,
+                "agent_session_id": "pytest-auth-session",
+                "nested_virtualization": True,
+            },
+            headers=kvm_control_headers,
+        )
+        self.assertEqual(nested_allowed.status_code, 202)
+        self.assertTrue(nested_allowed.json()["nested_virtualization"])
+
         dev_vm = self.control.post(
             "/v1/vms",
             json={
@@ -1719,6 +1856,137 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(other_private_image.status_code, 403)
         sandbox_images = self.control.get("/v1/images", params={"keyword": "sandbox"}, headers=repo_headers)
         self.assertEqual([image["image_id"] for image in sandbox_images.json()], ["default.sandbox.layer2"])
+
+    def test_bearer_auth_honors_forwarded_for_from_trusted_mcp_proxy(self) -> None:
+        self.tmp.cleanup()
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+        self.config_path = write_config(self.root)
+        config = json.loads(self.config_path.read_text())
+        config["auth"] = {
+            "admin_token": "admin-secret",
+            "trusted_proxy_cidrs": ["127.0.0.1/32"],
+            "acl": [
+                {"users": ["admin"], "source_cidrs": ["127.0.0.1/32"], "zones": ["dev", "stage", "misc", "live"]},
+                {"users": ["git.*"], "source_cidrs": ["192.0.2.1/32"], "zones": ["dev"]},
+            ],
+        }
+        self.config_path.write_text(json.dumps(config))
+        self.services = build_services(str(self.config_path))
+        self.control = TestClient(create_control_app(self.services))
+        self.lock = TestClient(create_lock_app(self.services))
+
+        created_token = self.control.post(
+            "/v1/admin/auth/tokens",
+            json={"username": "git.repo-a"},
+            headers={"Authorization": "Bearer admin-secret"},
+        )
+        self.assertEqual(created_token.status_code, 201)
+        headers = {
+            "Authorization": f"Bearer {created_token.json()['token']}",
+            "X-Forwarded-For": "192.0.2.1",
+        }
+
+        whoami = self.control.get("/v1/auth/whoami", headers=headers)
+
+        self.assertEqual(whoami.status_code, 200)
+        self.assertEqual(whoami.json()["username"], "git.repo-a")
+        self.assertEqual(whoami.json()["source_ip"], "192.0.2.1")
+        self.assertEqual(whoami.json()["allowed_zones"], ["dev"])
+
+    def test_repository_self_registration_key_mints_one_repo_token(self) -> None:
+        self.tmp.cleanup()
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+        self.config_path = write_config(self.root)
+        config = json.loads(self.config_path.read_text())
+        config["auth"] = {"admin_token": "admin-secret"}
+        self.config_path.write_text(json.dumps(config))
+        self.services = build_services(str(self.config_path))
+        self.control = TestClient(create_control_app(self.services))
+        self.lock = TestClient(create_lock_app(self.services))
+        admin_headers = {"Authorization": "Bearer admin-secret"}
+
+        created_key = self.control.post(
+            "/v1/admin/auth/repository-self-registration-keys",
+            json={"name": "codex-local-repositories"},
+            headers=admin_headers,
+        )
+        self.assertEqual(created_key.status_code, 201)
+        self.assertTrue(created_key.json()["key"].startswith("kvmreg_"))
+        registration_headers = {"Authorization": f"Bearer {created_key.json()['key']}"}
+
+        listed_keys = self.control.get("/v1/admin/auth/repository-self-registration-keys", headers=admin_headers)
+        self.assertEqual(listed_keys.status_code, 200)
+        self.assertEqual(listed_keys.json()[0]["name"], "codex-local-repositories")
+        self.assertNotIn("key", listed_keys.json()[0])
+
+        registered = self.control.post(
+            "/v1/auth/repository-self-registration",
+            json={"repository": "repo-a", "agent_session_id": "pytest-self-register"},
+            headers=registration_headers,
+        )
+        self.assertEqual(registered.status_code, 201)
+        self.assertEqual(registered.json()["username"], "git.repo-a")
+        self.assertEqual(registered.json()["namespace"], "git.repo-a")
+        self.assertEqual(registered.json()["token_file"], "repo.auth.token")
+        self.assertTrue(registered.json()["token"].startswith("kvm_"))
+        repo_headers = {"Authorization": f"Bearer {registered.json()['token']}"}
+
+        whoami = self.control.get("/v1/auth/whoami", headers=repo_headers)
+        self.assertEqual(whoami.status_code, 200)
+        self.assertEqual(whoami.json()["username"], "git.repo-a")
+        self.assertEqual(whoami.json()["namespace"], "git.repo-a")
+
+        duplicate = self.control.post(
+            "/v1/auth/repository-self-registration",
+            json={"repository": "repo-a", "agent_session_id": "pytest-duplicate"},
+            headers=registration_headers,
+        )
+        self.assertEqual(duplicate.status_code, 409)
+        self.assertEqual(duplicate.json()["detail"], "repository is already registered")
+
+        revoked = self.control.post(
+            f"/v1/admin/auth/tokens/{registered.json()['token_id']}/revoke",
+            headers=admin_headers,
+        )
+        self.assertEqual(revoked.status_code, 200)
+        replacement = self.control.post(
+            "/v1/auth/repository-self-registration",
+            json={"repository": "repo-a", "agent_session_id": "pytest-replacement"},
+            headers=registration_headers,
+        )
+        self.assertEqual(replacement.status_code, 201)
+        self.assertNotEqual(replacement.json()["token_id"], registered.json()["token_id"])
+
+    def test_repository_self_registration_rejects_bad_key_and_git_prefix(self) -> None:
+        self.tmp.cleanup()
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+        self.config_path = write_config(self.root)
+        config = json.loads(self.config_path.read_text())
+        config["auth"] = {"admin_token": "admin-secret"}
+        self.config_path.write_text(json.dumps(config))
+        self.services = build_services(str(self.config_path))
+        self.control = TestClient(create_control_app(self.services))
+        self.lock = TestClient(create_lock_app(self.services))
+
+        missing = self.control.post("/v1/auth/repository-self-registration", json={"repository": "repo-a"})
+        self.assertEqual(missing.status_code, 401)
+
+        admin_headers = {"Authorization": "Bearer admin-secret"}
+        created_key = self.control.post(
+            "/v1/admin/auth/repository-self-registration-keys",
+            json={"name": "codex-local-repositories"},
+            headers=admin_headers,
+        )
+        self.assertEqual(created_key.status_code, 201)
+        prefixed = self.control.post(
+            "/v1/auth/repository-self-registration",
+            json={"repository": "git.repo-a"},
+            headers={"Authorization": f"Bearer {created_key.json()['key']}"},
+        )
+        self.assertEqual(prefixed.status_code, 422)
 
     def test_open_auth_mode_accepts_anonymous_clients_and_enforces_valid_token(self) -> None:
         self.tmp.cleanup()
@@ -1968,6 +2236,252 @@ class ApiTests(unittest.TestCase):
         events = self.services.registry.list_status_events(limit=100)
         self.assertTrue(any(event["kind"] == "lease" and event["status"] == "expired" and event["namespace"] == "repo-lease" for event in events))
 
+    def test_lock_lease_can_request_bounded_long_ttl(self) -> None:
+        lock = self.lock.post(
+            "/v1/locks/requests",
+            json={"resource_id": "namespace:repo-long", "namespace": "repo-long", "lease_ttl_seconds": 3 * 24 * 60 * 60},
+        )
+        self.assertEqual(lock.status_code, 201)
+        self.assertEqual(lock.json()["lease_ttl_seconds"], 3 * 24 * 60 * 60)
+
+        refresh = self.lock.post(
+            f"/v1/locks/requests/{lock.json()['id']}/lease/refresh",
+            json={"lease_ttl_seconds": 4 * 24 * 60 * 60},
+        )
+        self.assertEqual(refresh.status_code, 200)
+        self.assertEqual(refresh.json()["lease_ttl_seconds"], 4 * 24 * 60 * 60)
+
+        too_long = self.lock.post(
+            f"/v1/locks/requests/{lock.json()['id']}/lease/refresh",
+            json={"lease_ttl_seconds": 8 * 24 * 60 * 60},
+        )
+        self.assertEqual(too_long.status_code, 422)
+
+    def test_reconcile_discards_stale_stopped_ephemeral_vms_only(self) -> None:
+        layer2 = self.root / "layer2" / "repo-cleanup--ubuntu-24.04.qcow2"
+        layer2.parent.mkdir(parents=True, exist_ok=True)
+        layer2.write_text("layer2", encoding="utf-8")
+
+        def seed(vm_slot: str, retention: str = "ephemeral") -> str:
+            vm_id = f"repo-cleanup-{vm_slot}"
+            layer3 = self.root / "layer3" / f"repo-cleanup--{vm_slot}.qcow2"
+            layer3.parent.mkdir(parents=True, exist_ok=True)
+            layer3.write_text(vm_id, encoding="utf-8")
+            self.services.registry.upsert_vm(
+                {
+                    "vm_id": vm_id,
+                    "namespace": "repo-cleanup",
+                    "vm_slot": vm_slot,
+                    "template_id": "ubuntu-24.04",
+                    "network_id": "dev",
+                    "vcpus": 1,
+                    "memory_mb": 512,
+                    "estimated_layer3_growth_mb": None,
+                    "reserved_ip": "10.90.0.120",
+                    "reserved_mac": f"52:54:00:00:10:{len(vm_slot):02x}",
+                    "power_state": "stopped",
+                    "readiness_state": "configuring",
+                    "status": "stopped",
+                    "layer2_path": str(layer2),
+                    "layer2_presence": "present",
+                    "layer3_path": str(layer3),
+                    "layer3_presence": "present",
+                    "pause_reason": None,
+                    "lock_resource_id": "namespace:repo-cleanup",
+                    "source_image_id": None,
+                    "retention": retention,
+                    "agent_session_id": "cleanup-test",
+                }
+            )
+            return vm_id
+
+        stale = seed("stale")
+        recent = seed("recent")
+        retained = seed("retained", retention="keep_stopped")
+        with self.services.registry.tx() as conn:
+            conn.execute(
+                """
+                UPDATE vm_instances
+                SET updated_at = CURRENT_TIMESTAMP,
+                    stopped_at = datetime(CURRENT_TIMESTAMP, '-25 hours')
+                WHERE vm_id IN (?, ?)
+                """,
+                (stale, retained),
+            )
+
+        result = cleanup_stale_stopped_ephemeral_vms(self.services.config, self.services.registry, self.services.executor)
+        self.assertEqual([item["vm_id"] for item in result["cleaned"]], [stale])
+        self.assertIsNone(self.services.registry.get_vm(stale))
+        self.assertIsNotNone(self.services.registry.get_vm(recent))
+        self.assertIsNotNone(self.services.registry.get_vm(retained))
+        self.assertFalse((self.root / "layer3" / "repo-cleanup--stale.qcow2").exists())
+        self.assertTrue((self.root / "layer3" / "repo-cleanup--recent.qcow2").exists())
+        self.assertTrue((self.root / "layer3" / "repo-cleanup--retained.qcow2").exists())
+
+    def test_monitor_runs_stale_stopped_ephemeral_vm_cleanup(self) -> None:
+        layer2 = self.root / "layer2" / "repo-monitor-cleanup--ubuntu-24.04.qcow2"
+        layer3 = self.root / "layer3" / "repo-monitor-cleanup--stale.qcow2"
+        layer2.parent.mkdir(parents=True, exist_ok=True)
+        layer3.parent.mkdir(parents=True, exist_ok=True)
+        layer2.write_text("layer2", encoding="utf-8")
+        layer3.write_text("stale", encoding="utf-8")
+        self.services.registry.upsert_vm(
+            {
+                "vm_id": "repo-monitor-cleanup-stale",
+                "namespace": "repo-monitor-cleanup",
+                "vm_slot": "stale",
+                "template_id": "ubuntu-24.04",
+                "network_id": "dev",
+                "vcpus": 1,
+                "memory_mb": 512,
+                "estimated_layer3_growth_mb": None,
+                "reserved_ip": "10.90.0.121",
+                "reserved_mac": "52:54:00:00:20:01",
+                "power_state": "stopped",
+                "readiness_state": "configuring",
+                "status": "stopped",
+                "layer2_path": str(layer2),
+                "layer2_presence": "present",
+                "layer3_path": str(layer3),
+                "layer3_presence": "present",
+                "pause_reason": None,
+                "lock_resource_id": "namespace:repo-monitor-cleanup",
+                "source_image_id": None,
+                "retention": "ephemeral",
+                "agent_session_id": "cleanup-test",
+            }
+        )
+        with self.services.registry.tx() as conn:
+            conn.execute(
+                """
+                UPDATE vm_instances
+                SET updated_at = CURRENT_TIMESTAMP,
+                    stopped_at = datetime(CURRENT_TIMESTAMP, '-25 hours')
+                WHERE vm_id = 'repo-monitor-cleanup-stale'
+                """
+            )
+
+        self.services.monitor._last_stale_ephemeral_cleanup_at = 0.0
+        self.services.monitor.sample_all_runs()
+        self.assertIsNone(self.services.registry.get_vm("repo-monitor-cleanup-stale"))
+        self.assertFalse(layer3.exists())
+
+    def test_monitor_runs_stale_trash_cleanup(self) -> None:
+        self.services.config.cleanup.trash_file_ttl_seconds = 86400
+        self.services.config.cleanup.trash_file_cleanup_interval_seconds = 60
+        self.services.monitor._last_stale_trash_cleanup_at = 0.0
+
+        with patch("kvm_control.monitor.cleanup_stale_trash_files", return_value={"deleted": [], "failed": []}) as cleanup:
+            self.services.monitor.sample_all_runs()
+
+        cleanup.assert_called_once_with(self.services.config, self.services.registry, self.services.executor)
+
+    def test_inspect_does_not_reset_stopped_ephemeral_cleanup_deadline(self) -> None:
+        create = self.control.post(
+            "/v1/vms",
+            json={
+                "namespace": "repo-inspect-cleanup",
+                "template_id": "ubuntu-24.04",
+                "vm_slot": "stale",
+                "network_id": "dev",
+                "autostart": False,
+                "lock_resource_id": "namespace:repo-inspect-cleanup",
+            },
+        )
+        self.assertEqual(create.status_code, 202)
+        vm_id = create.json()["vm_id"]
+        with self.services.registry.tx() as conn:
+            conn.execute(
+                """
+                UPDATE vm_instances
+                SET stopped_at = datetime(CURRENT_TIMESTAMP, '-25 hours'),
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE vm_id = ?
+                """,
+                (vm_id,),
+            )
+
+        inspected = self.control.get(f"/v1/vms/{vm_id}")
+        self.assertEqual(inspected.status_code, 200)
+        after_inspect = self.services.registry.get_vm(vm_id)
+        self.assertIsNotNone(after_inspect)
+        self.assertLess(after_inspect["stopped_at"], after_inspect["updated_at"])
+
+        result = cleanup_stale_stopped_ephemeral_vms(self.services.config, self.services.registry, self.services.executor)
+        self.assertEqual([item["vm_id"] for item in result["cleaned"]], [vm_id])
+        self.assertIsNone(self.services.registry.get_vm(vm_id))
+
+    def test_startup_reconcile_sets_stopped_at_to_host_boot_for_crashed_active_vm(self) -> None:
+        layer2 = self.root / "layer2" / "repo-boot-cleanup--ubuntu-24.04.qcow2"
+        layer3 = self.root / "layer3" / "repo-boot-cleanup--node.qcow2"
+        layer2.parent.mkdir(parents=True, exist_ok=True)
+        layer3.parent.mkdir(parents=True, exist_ok=True)
+        layer2.write_text("layer2", encoding="utf-8")
+        layer3.write_text("layer3", encoding="utf-8")
+        self.services.registry.upsert_vm(
+            {
+                "vm_id": "repo-boot-cleanup-node",
+                "namespace": "repo-boot-cleanup",
+                "vm_slot": "node",
+                "template_id": "ubuntu-24.04",
+                "network_id": "dev",
+                "vcpus": 1,
+                "memory_mb": 512,
+                "estimated_layer3_growth_mb": None,
+                "reserved_ip": "10.90.0.122",
+                "reserved_mac": "52:54:00:00:30:01",
+                "power_state": "running",
+                "readiness_state": "ready",
+                "status": "running",
+                "layer2_path": str(layer2),
+                "layer2_presence": "present",
+                "layer3_path": str(layer3),
+                "layer3_presence": "present",
+                "pause_reason": None,
+                "lock_resource_id": "namespace:repo-boot-cleanup",
+                "source_image_id": None,
+                "retention": "ephemeral",
+                "agent_session_id": "cleanup-test",
+            }
+        )
+        with self.services.registry.tx() as conn:
+            conn.execute(
+                """
+                UPDATE vm_instances
+                SET updated_at = '2026-08-01 08:00:00',
+                    stopped_at = NULL
+                WHERE vm_id = 'repo-boot-cleanup-node'
+                """
+            )
+
+        test_case = self
+
+        class FakeExecutor:
+            def run(self, action: str, payload: dict) -> dict:
+                test_case.assertEqual(action, "inspect-vm")
+                return {
+                    "result": "ok",
+                    "vm_id": payload["vm_id"],
+                    "domain_state": None,
+                    "power_state": "stopped",
+                    "current_ip": None,
+                    "host_booted_at": "2026-08-02T06:30:00+00:00",
+                    "inspected_at": "2026-08-02T12:00:00+00:00",
+                }
+
+        original_executor = self.services.executor
+        self.services.executor = FakeExecutor()  # type: ignore[assignment]
+        try:
+            result = reconcile_registered_vm_runtime_states(self.services)
+        finally:
+            self.services.executor = original_executor
+
+        self.assertEqual(result["failed"], [])
+        vm = self.services.registry.get_vm("repo-boot-cleanup-node")
+        self.assertIsNotNone(vm)
+        self.assertEqual(vm["power_state"], "stopped")
+        self.assertEqual(vm["stopped_at"], "2026-08-02 06:30:00")
+
     def test_guest_config_webroot_is_served_from_api_root(self) -> None:
         webroot = self.root / "webroot"
         webroot.mkdir(parents=True, exist_ok=True)
@@ -2213,7 +2727,7 @@ class ApiTests(unittest.TestCase):
 
         with self.control.websocket_connect("/status/ws") as websocket:
             replay = websocket.receive_json()
-            self.assertIn(replay["kind"], {"lock", "api_request"})
+            self.assertIn(replay["kind"], {"lock", "api_request", "executor"})
 
     def test_status_websocket_receives_live_updates(self) -> None:
         with self.control.websocket_connect("/status/ws") as websocket:

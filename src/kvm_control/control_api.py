@@ -1,9 +1,10 @@
 from __future__ import annotations
 
+import json
 import hashlib
+import hmac
 import ipaddress
 import re
-import socket
 import time
 from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath
@@ -18,12 +19,15 @@ from .auth import (
     current_principal,
     default_zone,
     effective_namespace,
+    generate_self_registration_key,
     generate_token,
     hash_token_secret,
     principal_to_dict,
     require_admin,
     require_auth,
     require_zone,
+    resolve_source_ip,
+    split_self_registration_key,
 )
 from .config import base_image_recipe_map, config_to_dict, layer2_image_recipe_map, template_map
 from .firewall import reconcile_firewall_access, reconcile_firewall_egress
@@ -38,8 +42,14 @@ from .models import (
     CreateEndpointWorkaroundRuleRequest,
     CreateFirewallEgressRuleRequest,
     CreateFirewallAccessRuleRequest,
+    CreateRepositorySelfRegistrationKeyRequest,
     CreateTestsuiteDependencyDocumentRequest,
+    RefreshLeaseRequest,
     ReleaseLockRequest,
+    RepositorySelfRegistrationKeyCreateResponse,
+    RepositorySelfRegistrationKeyResponse,
+    RepositorySelfRegistrationRequest,
+    RepositorySelfRegistrationResponse,
     ResizeLayer3Request,
     ResizeLayer3Response,
     SetVmRetentionRequest,
@@ -214,14 +224,6 @@ def _validate_run_event_details(payload: RunEventRequest, run: dict[str, Any], s
     if details.get("type") in ENDPOINT_WORKAROUND_EVIDENCE_TYPES:
         return _validate_endpoint_workaround_evidence(details, run, services)
     return details
-
-
-def _tcp_port_open(host: str, port: int, timeout_s: float = 3.0) -> bool:
-    try:
-        with socket.create_connection((host, port), timeout=timeout_s):
-            return True
-    except OSError:
-        return False
 
 
 def _canonicalize_firewall_egress_row(row: dict) -> dict:
@@ -422,6 +424,7 @@ def create_app(services: Services | None = None) -> FastAPI:
             agent_session_id=vm.get("agent_session_id"),
             agent_label=vm.get("agent_label"),
             handoff=vm.get("handoff"),
+            nested_virtualization=bool(vm.get("nested_virtualization")),
         )
 
     def promote_response_for(
@@ -518,6 +521,14 @@ def create_app(services: Services | None = None) -> FastAPI:
         if retention == "live" and not (principal.is_admin or principal.role == "live"):
             raise HTTPException(status_code=403, detail="retention denied")
 
+    def _validate_nested_virtualization(requested: bool, principal: AuthPrincipal) -> None:
+        if not requested:
+            return
+        allowed_repository_users = {"git.kvm-control", "git.vm-forgeyard"}
+        if principal.is_admin or principal.username in allowed_repository_users:
+            return
+        raise HTTPException(status_code=403, detail="nested virtualization denied")
+
     def _validate_ssh_public_key(value: str | None) -> str | None:
         if value is None:
             return None
@@ -552,10 +563,13 @@ def create_app(services: Services | None = None) -> FastAPI:
             "base_image": str(services.config.storage.base_dir / template.base_image),
             "base_image_format": template.base_image_format,
             "template_architecture": template.architecture,
+            "template_machine_type": template.machine_type,
             "template_boot_mode": template.boot_mode,
             "template_kernel_path": template.kernel_path,
             "template_initrd_path": template.initrd_path,
             "template_kernel_append": template.kernel_append,
+            "authorized_keys_path": str(services.config.image_factory.authorized_keys_path),
+            "nested_virtualization": bool(vm.get("nested_virtualization")),
             **({"ssh_public_key": vm["ssh_public_key"]} if vm.get("ssh_public_key") else {}),
         }
 
@@ -707,6 +721,105 @@ def create_app(services: Services | None = None) -> FastAPI:
         if services.config.auth.enabled and not principal.authenticated:
             raise HTTPException(status_code=401, detail="admin token required")
 
+    def _source_allowed(source_ip: str, source_cidrs: list[str]) -> bool:
+        if not source_cidrs:
+            return True
+        try:
+            address = ipaddress.ip_address(source_ip)
+        except ValueError:
+            return False
+        for cidr in source_cidrs:
+            if address in ipaddress.ip_network(cidr, strict=False):
+                return True
+        return False
+
+    def _repository_self_registration_key(request: Request) -> dict:
+        authorization = request.headers.get("authorization", "")
+        if not authorization.lower().startswith("bearer "):
+            raise HTTPException(
+                status_code=401,
+                detail="repository self-registration key required",
+                headers={"WWW-Authenticate": "Bearer"},
+            )
+        split = split_self_registration_key(authorization.split(" ", 1)[1].strip())
+        if split is None:
+            raise HTTPException(
+                status_code=401,
+                detail="invalid repository self-registration key",
+                headers={"WWW-Authenticate": "Bearer"},
+            )
+        key_id, secret = split
+        record = services.registry.get_repository_self_registration_key(key_id)
+        if record is None or record.get("revoked_at"):
+            raise HTTPException(
+                status_code=401,
+                detail="invalid repository self-registration key",
+                headers={"WWW-Authenticate": "Bearer"},
+            )
+        expected = record["secret_hash"]
+        actual = hash_token_secret(secret)
+        if not hmac.compare_digest(actual, expected):
+            raise HTTPException(
+                status_code=401,
+                detail="invalid repository self-registration key",
+                headers={"WWW-Authenticate": "Bearer"},
+            )
+        source_ip = resolve_source_ip(services.config, request)
+        if not _source_allowed(source_ip, record.get("source_cidrs") or []):
+            raise HTTPException(status_code=403, detail="repository self-registration source denied")
+        return record
+
+    def _repository_username(repository: str) -> str:
+        if repository.startswith("git."):
+            raise HTTPException(status_code=422, detail="repository must not include git. prefix")
+        return f"git.{repository}"
+
+    @app.post(
+        "/v1/auth/repository-self-registration",
+        response_model=RepositorySelfRegistrationResponse,
+        status_code=201,
+    )
+    def self_register_repository(
+        payload: RepositorySelfRegistrationRequest,
+        request: Request,
+    ) -> RepositorySelfRegistrationResponse:
+        key = _repository_self_registration_key(request)
+        username = _repository_username(payload.repository)
+        existing = services.registry.get_auth_token_by_username(username)
+        if existing is not None and not existing.get("revoked_at"):
+            raise HTTPException(status_code=409, detail="repository is already registered")
+        token_id, secret, token = generate_token()
+        try:
+            record = services.registry.replace_revoked_auth_token(
+                token_id=token_id,
+                username=username,
+                role="repository",
+                namespace=username,
+                secret_hash=hash_token_secret(secret),
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        services.registry.mark_repository_self_registration_key_used(key["key_id"])
+        services.registry.record_status_event(
+            kind="auth",
+            level="info",
+            status="completed",
+            summary=f"repository self-registered {username}",
+            details={
+                "username": username,
+                "namespace": username,
+                "registration_key_id": key["key_id"],
+                "registration_key_name": key["name"],
+                "source_ip": resolve_source_ip(services.config, request),
+                "agent_session_id": payload.agent_session_id,
+            },
+        )
+        response = dict(record)
+        response["token"] = token
+        response["token_file"] = "repo.auth.token"
+        response["token_file_comment"] = "kvm-control MCP/API bearer token for this repository."
+        return _model_validate(RepositorySelfRegistrationResponse, response)
+
     def _base_image_output_paths(recipe: dict) -> tuple[Path, Path, Path]:
         suffix = recipe["output_format"]
         image_path = services.config.storage.base_dir / f"{recipe['catalog_image_id']}.{suffix}"
@@ -755,6 +868,7 @@ def create_app(services: Services | None = None) -> FastAPI:
             "authorized_keys_path": str(services.config.image_factory.authorized_keys_path),
             "template_id": template.id if template else recipe["template_id"],
             "template_architecture": template.architecture if template else "x86_64",
+            "template_machine_type": template.machine_type if template else "pc-i440fx-10.0",
             "template_boot_mode": template.boot_mode if template else "disk",
             "template_kernel_path": template.kernel_path if template else None,
             "template_initrd_path": template.initrd_path if template else None,
@@ -907,6 +1021,55 @@ def create_app(services: Services | None = None) -> FastAPI:
         response["token"] = token
         return _model_validate(AuthTokenCreateResponse, response)
 
+    @api.post(
+        "/v1/admin/auth/repository-self-registration-keys",
+        response_model=RepositorySelfRegistrationKeyCreateResponse,
+        status_code=201,
+    )
+    def create_repository_self_registration_key(
+        payload: CreateRepositorySelfRegistrationKeyRequest,
+        principal: AuthPrincipal = Depends(require_admin),
+    ) -> RepositorySelfRegistrationKeyCreateResponse:
+        source_cidrs = [_normalize_source_cidr(value) for value in payload.source_cidrs]
+        key_id, secret, key = generate_self_registration_key()
+        try:
+            record = services.registry.create_repository_self_registration_key(
+                key_id=key_id,
+                name=payload.name,
+                secret_hash=hash_token_secret(secret),
+                source_cidrs=source_cidrs,
+            )
+        except Exception as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        response = dict(record)
+        response["key"] = key
+        return _model_validate(RepositorySelfRegistrationKeyCreateResponse, response)
+
+    @api.get(
+        "/v1/admin/auth/repository-self-registration-keys",
+        response_model=list[RepositorySelfRegistrationKeyResponse],
+    )
+    def list_repository_self_registration_keys(
+        principal: AuthPrincipal = Depends(require_admin),
+    ) -> list[RepositorySelfRegistrationKeyResponse]:
+        return [
+            _model_validate(RepositorySelfRegistrationKeyResponse, row)
+            for row in services.registry.list_repository_self_registration_keys()
+        ]
+
+    @api.post(
+        "/v1/admin/auth/repository-self-registration-keys/{key_id}/revoke",
+        response_model=RepositorySelfRegistrationKeyResponse,
+    )
+    def revoke_repository_self_registration_key(
+        key_id: str,
+        principal: AuthPrincipal = Depends(require_admin),
+    ) -> RepositorySelfRegistrationKeyResponse:
+        record = services.registry.revoke_repository_self_registration_key(key_id)
+        if record is None:
+            raise HTTPException(status_code=404, detail="repository self-registration key not found")
+        return _model_validate(RepositorySelfRegistrationKeyResponse, record)
+
     @api.get("/v1/admin/auth/tokens", response_model=list[AuthTokenResponse])
     def list_auth_tokens(principal: AuthPrincipal = Depends(require_admin)) -> list[AuthTokenResponse]:
         return [_model_validate(AuthTokenResponse, row) for row in services.registry.list_auth_tokens()]
@@ -921,7 +1084,9 @@ def create_app(services: Services | None = None) -> FastAPI:
     @api.post("/v1/locks/requests", status_code=201)
     def create_lock_request(request: CreateLockRequest, principal: AuthPrincipal = Depends(current_principal)) -> dict:
         namespace = effective_namespace(principal, request.namespace)
-        return _decorate_auth(services.registry.ensure_lock_request(request.resource_id, namespace), principal)
+        if request.lease_ttl_seconds is not None and request.lease_ttl_seconds > services.config.leases.max_namespace_lock_ttl_seconds:
+            raise HTTPException(status_code=422, detail="lease_ttl_seconds exceeds maximum")
+        return _decorate_auth(services.registry.ensure_lock_request(request.resource_id, namespace, ttl_seconds=request.lease_ttl_seconds), principal)
 
     @api.get("/v1/locks/resources")
     def list_lock_resources() -> list[dict]:
@@ -958,13 +1123,16 @@ def create_app(services: Services | None = None) -> FastAPI:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
 
     @api.post("/v1/locks/requests/{request_id}/lease/refresh")
-    def refresh_lock_lease(request_id: int, principal: AuthPrincipal = Depends(current_principal)) -> dict:
+    def refresh_lock_lease(request_id: int, payload: RefreshLeaseRequest | None = None, principal: AuthPrincipal = Depends(current_principal)) -> dict:
         try:
+            payload = payload or RefreshLeaseRequest()
+            if payload.lease_ttl_seconds is not None and payload.lease_ttl_seconds > services.config.leases.max_namespace_lock_ttl_seconds:
+                raise HTTPException(status_code=422, detail="lease_ttl_seconds exceeds maximum")
             record = services.registry.get_lock_request(request_id)
             if record is None:
                 raise KeyError(request_id)
             namespace = effective_namespace(principal, record["namespace"])
-            refreshed = services.registry.refresh_lock_lease(request_id, namespace)
+            refreshed = services.registry.refresh_lock_lease(request_id, namespace, ttl_seconds=payload.lease_ttl_seconds)
             return _decorate_auth(refreshed, principal)
         except KeyError:
             raise HTTPException(status_code=404, detail="lock request not found") from None
@@ -1693,6 +1861,7 @@ def create_app(services: Services | None = None) -> FastAPI:
         require_zone(principal, payload.network_id)
         retention = _default_retention(payload)
         _validate_retention(retention, principal)
+        _validate_nested_virtualization(payload.nested_virtualization, principal)
         ssh_public_key = _validate_ssh_public_key(payload.ssh_public_key)
         template = templates.get(payload.template_id)
         if template is None:
@@ -1822,6 +1991,7 @@ def create_app(services: Services | None = None) -> FastAPI:
                 "agent_label": payload.agent_label,
                 "handoff": payload.handoff,
                 "ssh_public_key": ssh_public_key,
+                "nested_virtualization": int(payload.nested_virtualization),
             }
         )
 
@@ -2043,7 +2213,10 @@ def create_app(services: Services | None = None) -> FastAPI:
         started_at: float,
         timed_out: bool = False,
         reason: str | None = None,
+        readiness_probe: str = "root_ssh_command",
+        ssh_login_verified: bool | None = None,
     ) -> WaitVmReadyResponse:
+        verified = ready if ssh_login_verified is None else ssh_login_verified
         return _model_validate(
             WaitVmReadyResponse,
             {
@@ -2056,6 +2229,9 @@ def create_app(services: Services | None = None) -> FastAPI:
                 "readiness_state": vm["readiness_state"],
                 "reserved_ip": vm["reserved_ip"],
                 "ssh_target": f"root@{vm['reserved_ip']}",
+                "readiness_probe": readiness_probe,
+                "ssh_login_verified": verified,
+                "scp_verified": False,
                 "current_ip": vm.get("current_ip"),
                 "reason": reason,
             },
@@ -2070,34 +2246,73 @@ def create_app(services: Services | None = None) -> FastAPI:
         payload = payload or WaitVmReadyRequest()
         started_at = time.monotonic()
         deadline = started_at + payload.timeout_s
+        operation_id: int | None = None
+        last_ssh_error: str | None = None
         while True:
             vm = _sync_vm_runtime_state(_load_vm(vm_id))
             _require_vm_access(vm, principal)
-            if vm["readiness_state"] == "ready":
-                return _wait_ready_response(vm, ready=True, started_at=started_at)
+            if vm["readiness_state"] == "ready" and not payload.check_ssh:
+                return _wait_ready_response(vm, ready=True, started_at=started_at, ssh_login_verified=False)
             if vm["readiness_state"] == "failed" or vm["power_state"] == "failed":
                 return _wait_ready_response(vm, ready=False, started_at=started_at, reason="VM is failed")
             if vm["power_state"] != "running":
                 return _wait_ready_response(vm, ready=False, started_at=started_at, reason="VM is not running")
-            if payload.check_ssh and _tcp_port_open(vm["reserved_ip"], 22):
-                operation_id = services.registry.create_operation(
-                    "wait-ready",
-                    vm_id,
-                    vm["namespace"],
-                    "running",
-                    details={"reserved_ip": vm["reserved_ip"], "port": 22},
-                )
-                vm = services.registry.patch_vm(vm_id, readiness_state="ready", status="running")
-                services.registry.update_operation(operation_id, "completed", details={"reserved_ip": vm["reserved_ip"], "port": 22})
-                return _wait_ready_response(vm, ready=True, started_at=started_at)
+            if payload.check_ssh:
+                if operation_id is None:
+                    operation_id = services.registry.create_operation(
+                        "wait-ready",
+                        vm_id,
+                        vm["namespace"],
+                        "running",
+                        details={"reserved_ip": vm["reserved_ip"], "probe": "root_ssh_command"},
+                    )
+                try:
+                    probe = services.executor.run(
+                        "wait-ssh",
+                        {
+                            "operation_id": operation_id,
+                            "vm_id": vm_id,
+                            "namespace": vm["namespace"],
+                            "reserved_ip": vm["reserved_ip"],
+                            "timeout_s": min(15, max(1, payload.poll_interval_s)),
+                        },
+                    )
+                except RuntimeError as exc:
+                    probe = {"ssh_login_verified": False, "readiness_probe": "root_ssh_command", "error": str(exc)}
+                if probe.get("ssh_login_verified"):
+                    vm = services.registry.patch_vm(vm_id, readiness_state="ready", status="running")
+                    services.registry.update_operation(
+                        operation_id,
+                        "completed",
+                        details={
+                            "reserved_ip": vm["reserved_ip"],
+                            "probe": probe.get("readiness_probe", "root_ssh_command"),
+                            "ssh_login_verified": True,
+                            "scp_verified": bool(probe.get("scp_verified", False)),
+                        },
+                    )
+                    return _wait_ready_response(vm, ready=True, started_at=started_at, ssh_login_verified=True)
+                last_ssh_error = str(probe.get("error") or "SSH login probe did not succeed")
+            elif not payload.check_ssh:
+                last_ssh_error = None
             now = time.monotonic()
             if now >= deadline:
+                reason = "timed out waiting for root SSH login on reserved_ip" if payload.check_ssh else "timed out waiting for readiness_state=ready"
+                if last_ssh_error:
+                    reason = f"{reason}: {last_ssh_error}"
+                if operation_id is not None:
+                    services.registry.update_operation(
+                        operation_id,
+                        "failed",
+                        details={"reserved_ip": vm["reserved_ip"], "probe": "root_ssh_command", "error": last_ssh_error},
+                    )
                 return _wait_ready_response(
                     vm,
                     ready=False,
                     started_at=started_at,
                     timed_out=True,
-                    reason="timed out waiting for reserved_ip tcp/22" if payload.check_ssh else "timed out waiting for readiness_state=ready",
+                    reason=reason,
+                    ssh_login_verified=False,
                 )
             time.sleep(min(payload.poll_interval_s, max(0.0, deadline - now)))
 

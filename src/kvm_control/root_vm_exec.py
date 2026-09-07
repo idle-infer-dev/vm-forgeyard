@@ -51,7 +51,9 @@ ALLOWED_ACTIONS = {
     "delete-runtime",
     "reconcile-runtime",
     "cleanup-after-boot",
+    "cleanup-trash",
     "get-host-capacity",
+    "wait-ssh",
 }
 
 
@@ -125,6 +127,7 @@ def _touch_qcow(
     if qemu_img and backing_file:
         command = [qemu_img, "create", "-f", "qcow2", "-F", backing_format, "-b", backing_file, str(path)]
         if virtual_size_bytes is not None:
+            command.insert(-1, "-u")
             command.append(str(virtual_size_bytes))
         subprocess.run(
             command,
@@ -393,12 +396,12 @@ def _run_command(command: list[str], check: bool = True) -> subprocess.Completed
     return completed
 
 
-def _run_progress_command(config: AppConfig, action: str, subject_id: str | None, step: str, command: list[str]) -> subprocess.CompletedProcess[str]:
+def _run_progress_command(config: AppConfig, action: str, subject_id: str | None, step: str, command: list[str], check: bool = True) -> subprocess.CompletedProcess[str]:
     started = time.monotonic()
     command_text = " ".join(shlex.quote(part) for part in command)
     _progress_log(config, action, subject_id, step, "running", {"command": command_text})
     try:
-        completed = _run_command(command)
+        completed = _run_command(command, check=check)
     except Exception as exc:
         _progress_log(
             config,
@@ -446,22 +449,26 @@ def _planned_base_image_commands(config: AppConfig, payload: dict[str, Any]) -> 
     image_path = payload["image_path"]
     mount_label = "BUILD_MOUNT"
     packages = _base_image_packages(recipe)
+    debootstrap_command = [
+        "env",
+        "DEBOOTSTRAP_DIR=/usr/share/debootstrap",
+        "debootstrap",
+        "--arch=amd64",
+        "--variant=minbase",
+        f"--keyring={_debootstrap_keyring(recipe)}",
+        recipe["suite"],
+        mount_label,
+        recipe["repository_urls"][0],
+        _debootstrap_script(recipe),
+    ]
+    apt_http_proxy = _base_image_apt_http_proxy(config, recipe)
+    if apt_http_proxy:
+        debootstrap_command[1:1] = [f"http_proxy={apt_http_proxy}", f"https_proxy={apt_http_proxy}"]
     commands = [
         ["truncate", "-s", f"{payload['image_size_mb']}M", image_path],
         ["mkfs.ext4", "-F", "-L", recipe["catalog_image_id"][:16], image_path],
         ["mount", "-o", "loop", image_path, mount_label],
-        [
-            "env",
-            "DEBOOTSTRAP_DIR=/usr/share/debootstrap",
-            "debootstrap",
-            "--arch=amd64",
-            "--variant=minbase",
-            f"--keyring={_debootstrap_keyring(recipe)}",
-            recipe["suite"],
-            mount_label,
-            recipe["repository_urls"][0],
-            _debootstrap_script(recipe),
-        ],
+        debootstrap_command,
         ["chroot", mount_label, "apt-get", "install", "-y", *packages],
         ["umount", mount_label],
         ["e2fsck", "-fy", image_path],
@@ -743,13 +750,30 @@ def _layer2_bootstrap_script(config: AppConfig, recipe: dict[str, Any]) -> str:
     )
     return f"""set -euxo pipefail
 export DEBIAN_FRONTEND=noninteractive
+export NEEDRESTART_MODE=a
 {dns_block}
 {proxy_block}
 if [ -x /usr/local/sbin/kvm-control-grow-rootfs ]; then
     /usr/local/sbin/kvm-control-grow-rootfs || true
 fi
+cat >/usr/sbin/policy-rc.d <<'EOF'
+#!/bin/sh
+exit 101
+EOF
+chmod 0755 /usr/sbin/policy-rc.d
+held_packages="$(dpkg-query -W -f='${{binary:Package}}\\n' systemd systemd-sysv systemd-timesyncd udev libsystemd0 libudev1 libpam-systemd 2>/dev/null || true)"
+if [ -n "$held_packages" ]; then
+    apt-mark hold $held_packages
+fi
+cleanup_layer2_build() {{
+    rm -f /usr/sbin/policy-rc.d
+    if [ -n "$held_packages" ]; then
+        apt-mark unhold $held_packages || true
+    fi
+}}
+trap cleanup_layer2_build EXIT
 {apt_update}
-apt-get install -y {packages}
+apt-get install -y --no-upgrade {packages}
 {accounts}
 {python_tools}
 {services}
@@ -803,6 +827,53 @@ def _copy_authorized_keys(source_path: Path, root: Path) -> bool:
     os.chmod(target_dir, 0o700)
     os.chmod(target, 0o600)
     return True
+
+
+def _read_public_key_line(path: Path) -> str | None:
+    if not path.exists():
+        return None
+    for raw in path.read_text(encoding="utf-8", errors="ignore").splitlines():
+        line = raw.strip()
+        if line.startswith(("ssh-ed25519 ", "ssh-rsa ", "ecdsa-sha2-")):
+            return line
+    return None
+
+
+def _public_key_for_private_identity(path: Path) -> str | None:
+    public_key = _read_public_key_line(Path(f"{path}.pub"))
+    if public_key:
+        return public_key
+    if not path.exists():
+        return None
+    ssh_keygen = shutil.which("ssh-keygen")
+    if ssh_keygen is None:
+        return None
+    completed = subprocess.run(
+        [ssh_keygen, "-y", "-f", str(path)],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    if completed.returncode != 0:
+        return None
+    return _read_public_key_line_from_text(completed.stdout)
+
+
+def _read_public_key_line_from_text(text: str) -> str | None:
+    for raw in text.splitlines():
+        line = raw.strip()
+        if line.startswith(("ssh-ed25519 ", "ssh-rsa ", "ecdsa-sha2-")):
+            return line
+    return None
+
+
+def _append_host_ssh_identity_public_keys(root: Path, identity_dir: Path = Path("/root/.ssh")) -> int:
+    added = 0
+    for name in ("id_ed25519", "id_ecdsa", "id_rsa"):
+        public_key = _public_key_for_private_identity(identity_dir / name)
+        if public_key and _append_guest_ssh_public_key(root, public_key):
+            added += 1
+    return added
 
 
 def _base_image_packages(recipe: dict[str, Any]) -> list[str]:
@@ -886,6 +957,10 @@ def _recipe_apt_http_proxy(recipe: dict[str, Any]) -> str | None:
     return proxy_url
 
 
+def _base_image_apt_http_proxy(config: AppConfig, recipe: dict[str, Any]) -> str | None:
+    return _recipe_apt_http_proxy(recipe) or config.guest_bootstrap.apt_http_proxy
+
+
 def _write_debootstrap_base_config(root: Path, config: AppConfig, payload: dict[str, Any]) -> None:
     recipe = payload["recipe"]
     hostname = _base_image_hostname(recipe)
@@ -894,7 +969,7 @@ def _write_debootstrap_base_config(root: Path, config: AppConfig, payload: dict[
     apt_conf_dir = root / "etc/apt/apt.conf.d"
     apt_conf_dir.mkdir(parents=True, exist_ok=True)
     (apt_conf_dir / "80-kvm-control-retries.conf").write_text('Acquire::Retries "3";\n', encoding="utf-8")
-    apt_http_proxy = _recipe_apt_http_proxy(recipe)
+    apt_http_proxy = _base_image_apt_http_proxy(config, recipe)
     if apt_http_proxy:
         (apt_conf_dir / "80-proxy.conf").write_text(
             f'Acquire::http::Proxy "{apt_http_proxy}";\n',
@@ -1050,23 +1125,27 @@ def _build_debootstrap_image(config: AppConfig, payload: dict[str, Any], planned
         _run_progress_command(config, action, subject_id, "format ext4 filesystem", ["mkfs.ext4", "-F", "-L", recipe["catalog_image_id"][:16], str(tmp_image)])
         _run_progress_command(config, action, subject_id, "mount build filesystem", ["mount", "-o", "loop", str(tmp_image), str(mount_dir)])
         mounted = True
+        debootstrap_command = [
+            "env",
+            "DEBOOTSTRAP_DIR=/usr/share/debootstrap",
+            "debootstrap",
+            "--arch=amd64",
+            "--variant=minbase",
+            f"--keyring={_debootstrap_keyring(recipe)}",
+            recipe["suite"],
+            str(mount_dir),
+            recipe["repository_urls"][0],
+            _debootstrap_script(recipe),
+        ]
+        apt_http_proxy = _base_image_apt_http_proxy(config, recipe)
+        if apt_http_proxy:
+            debootstrap_command[1:1] = [f"http_proxy={apt_http_proxy}", f"https_proxy={apt_http_proxy}"]
         _run_progress_command(
             config,
             action,
             subject_id,
             "debootstrap base system",
-            [
-                "env",
-                "DEBOOTSTRAP_DIR=/usr/share/debootstrap",
-                "debootstrap",
-                "--arch=amd64",
-                "--variant=minbase",
-                f"--keyring={_debootstrap_keyring(recipe)}",
-                recipe["suite"],
-                str(mount_dir),
-                recipe["repository_urls"][0],
-                _debootstrap_script(recipe),
-            ]
+            debootstrap_command
         )
         shutil.copy2("/etc/resolv.conf", mount_dir / "etc/resolv.conf")
         _write_debootstrap_base_config(mount_dir, config, payload)
@@ -1505,6 +1584,16 @@ def _map_domain_state(domain_state: str | None) -> str:
     return "failed"
 
 
+def _host_booted_at() -> str | None:
+    try:
+        for line in Path("/proc/stat").read_text(encoding="utf-8").splitlines():
+            if line.startswith("btime "):
+                return datetime.fromtimestamp(int(line.split()[1]), UTC).isoformat()
+    except (OSError, ValueError, IndexError):
+        return None
+    return None
+
+
 def _wait_for_domain_state(vm_id: str, expected: set[str], timeout_s: float) -> str | None:
     deadline = time.monotonic() + timeout_s
     while time.monotonic() < deadline:
@@ -1555,6 +1644,7 @@ def _write_runtime_xml(config: AppConfig, payload: dict[str, Any]) -> Path:
     vm_id = payload["vm_id"]
     runtime_xml = _runtime_xml(config, vm_id)
     architecture = payload.get("template_architecture", "x86_64")
+    machine_type = payload.get("template_machine_type", "pc-i440fx-10.0")
     boot_mode = payload.get("template_boot_mode", "disk")
     kernel_path = payload.get("template_kernel_path")
     initrd_path = payload.get("template_initrd_path")
@@ -1567,7 +1657,7 @@ def _write_runtime_xml(config: AppConfig, payload: dict[str, Any]) -> Path:
         f"  <memory unit='MiB'>{payload['memory_mb']}</memory>",
         f"  <vcpu placement='static'>{payload['vcpus']}</vcpu>",
         "  <os>",
-        f"    <type arch='{architecture}' machine='pc-i440fx-10.0'>hvm</type>",
+        f"    <type arch='{architecture}' machine='{machine_type}'>hvm</type>",
     ]
     if boot_mode == "direct_kernel":
         if not kernel_path or not initrd_path:
@@ -1629,6 +1719,47 @@ def _network_settings(config: AppConfig, network_id: str) -> tuple[str, int]:
     return config.network.gateway, int(network.prefixlen)
 
 
+def _guest_netplan_config(mac: str, ip_address: str, prefix: int, gateway: str) -> str:
+    return "\n".join(
+        [
+            "network:",
+            "  version: 2",
+            "  renderer: networkd",
+            "  ethernets:",
+            "    kvm-control:",
+            "      match:",
+            f"        macaddress: \"{mac}\"",
+            "      dhcp4: false",
+            f"      addresses: [{ip_address}/{prefix}]",
+            "      routes:",
+            "        - to: default",
+            f"          via: {gateway}",
+            "      nameservers:",
+            f"        addresses: [{gateway}]",
+            "",
+        ]
+    )
+
+
+def _guest_systemd_bootstrap_unit() -> str:
+    return """[Unit]
+Description=kvm-control guest bootstrap
+DefaultDependencies=no
+After=local-fs.target
+Before=network-pre.target network.target ssh.service sshd.service
+Wants=network-pre.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/kvm-control-configure-network
+ExecStart=/usr/local/sbin/kvm-control-grow-rootfs
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
+"""
+
+
 def _write_guest_bootstrap_script(config: AppConfig, payload: dict[str, Any]) -> Path:
     gateway, prefix = _network_settings(config, payload["network_id"])
     apt_http_proxy = config.guest_bootstrap.apt_http_proxy
@@ -1647,16 +1778,23 @@ def _write_guest_bootstrap_script(config: AppConfig, payload: dict[str, Any]) ->
             f"KVM_CONTROL_APT_HTTP_PROXY={_shell_value(apt_http_proxy or '')}",
         ]
     )
+    netplan_text = _guest_netplan_config(mac, str(payload["reserved_ip"]), prefix, gateway)
+    systemd_unit = _guest_systemd_bootstrap_unit()
     proxy_literal = shlex.quote(apt_http_proxy or "")
     script = f"""#!/bin/sh
 set -eu
 
-mkdir -p /etc/kvm-control /etc/cron.d /etc/apt/apt.conf.d /usr/local/sbin /var/log/kvm-control
+mkdir -p /etc/kvm-control /etc/cron.d /etc/apt/apt.conf.d /etc/netplan /etc/systemd/system/multi-user.target.wants /usr/local/sbin /var/log/kvm-control
 
 cat >/etc/kvm-control/vm.env <<'EOF_KVM_CONTROL_ENV'
 {env_text}
 EOF_KVM_CONTROL_ENV
 chmod 0644 /etc/kvm-control/vm.env
+
+cat >/etc/netplan/01-kvm-control.yaml <<'EOF_KVM_CONTROL_NETPLAN'
+{netplan_text}
+EOF_KVM_CONTROL_NETPLAN
+chmod 0644 /etc/netplan/01-kvm-control.yaml
 
 if [ -n {proxy_literal} ]; then
     printf 'Acquire::http::Proxy "%s";\\n' {proxy_literal} >/etc/apt/apt.conf.d/80-proxy.conf
@@ -1706,6 +1844,9 @@ ip addr flush dev "$iface" || true
 ip link set "$iface" up
 ip addr add "$KVM_CONTROL_IPV4_ADDRESS/$KVM_CONTROL_IPV4_PREFIX" dev "$iface" 2>/dev/null || true
 ip route replace default via "$KVM_CONTROL_IPV4_GATEWAY" dev "$iface" || true
+if command -v netplan >/dev/null 2>&1; then
+    netplan apply || true
+fi
 EOF_KVM_CONTROL_NETWORK
 chmod 0755 /usr/local/sbin/kvm-control-configure-network
 
@@ -1780,6 +1921,11 @@ for runlevel_dir in /etc/rcS.d /etc/rc2.d /etc/rc3.d /etc/rc4.d /etc/rc5.d; do
     mkdir -p "$runlevel_dir"
     ln -sf ../init.d/kvm-control "$runlevel_dir/S02kvm-control"
 done
+cat >/etc/systemd/system/kvm-control-bootstrap.service <<'EOF_KVM_CONTROL_SYSTEMD'
+{systemd_unit}
+EOF_KVM_CONTROL_SYSTEMD
+chmod 0644 /etc/systemd/system/kvm-control-bootstrap.service
+ln -sf ../kvm-control-bootstrap.service /etc/systemd/system/multi-user.target.wants/kvm-control-bootstrap.service
 
 /usr/local/sbin/kvm-control-configure-network >>/var/log/kvm-control/network.log 2>&1 || true
 /usr/local/sbin/kvm-control-grow-rootfs >>/var/log/kvm-control/grow-rootfs.log 2>&1 || true
@@ -1793,6 +1939,7 @@ def _guest_bootstrap_file_contents(config: AppConfig, payload: dict[str, Any]) -
     gateway, prefix = _network_settings(config, payload["network_id"])
     apt_http_proxy = config.guest_bootstrap.apt_http_proxy or ""
     mac = str(payload["reserved_mac"]).lower()
+    netplan_text = _guest_netplan_config(mac, str(payload["reserved_ip"]), prefix, gateway)
     env_text = "\n".join(
         [
             f"KVM_CONTROL_VM_ID={_shell_value(payload['vm_id'])}",
@@ -1848,6 +1995,9 @@ ip addr flush dev "$iface" || true
 ip link set "$iface" up
 ip addr add "$KVM_CONTROL_IPV4_ADDRESS/$KVM_CONTROL_IPV4_PREFIX" dev "$iface" 2>/dev/null || true
 ip route replace default via "$KVM_CONTROL_IPV4_GATEWAY" dev "$iface" || true
+if command -v netplan >/dev/null 2>&1; then
+    netplan apply || true
+fi
 """
     grow_script = """#!/bin/sh
 set -eu
@@ -1912,8 +2062,10 @@ exit 0
     return {
         "/etc/kvm-control/vm.env": env_text + "\n",
         "/etc/apt/apt.conf.d/80-proxy.conf": apt_proxy,
+        "/etc/netplan/01-kvm-control.yaml": netplan_text,
         "/usr/local/sbin/kvm-control-configure-network": network_script,
         "/usr/local/sbin/kvm-control-grow-rootfs": grow_script,
+        "/etc/systemd/system/kvm-control-bootstrap.service": _guest_systemd_bootstrap_unit(),
         "/etc/cron.d/kvm-control": cron,
         "/etc/init.d/kvm-control": init_script,
         "/etc/rcS.d/S02kvm-control": init_script,
@@ -1933,6 +2085,12 @@ def _write_guest_bootstrap_files(root: Path, config: AppConfig, payload: dict[st
             target.chmod(0o755)
         else:
             target.chmod(0o644)
+    systemd_wants = root / "etc/systemd/system/multi-user.target.wants"
+    systemd_wants.mkdir(parents=True, exist_ok=True)
+    systemd_link = systemd_wants / "kvm-control-bootstrap.service"
+    if systemd_link.exists() or systemd_link.is_symlink():
+        systemd_link.unlink()
+    os.symlink("../kvm-control-bootstrap.service", systemd_link)
     (root / "var/log/kvm-control").mkdir(parents=True, exist_ok=True)
 
 
@@ -2012,12 +2170,17 @@ def _prepare_layer3_guest_bootstrap(config: AppConfig, payload: dict[str, Any]) 
         _run_command(["mount", "-o", "rw", root_device, str(mount_dir)])
         mounted = True
         _write_guest_bootstrap_files(mount_dir, config, payload)
+        authorized_keys_path = _resolve(str(payload.get("authorized_keys_path") or config.image_factory.authorized_keys_path))
+        host_authorized_keys_copied = _copy_authorized_keys(authorized_keys_path, mount_dir)
+        host_identity_keys_available = _append_host_ssh_identity_public_keys(mount_dir)
         ssh_key_added = _append_guest_ssh_public_key(mount_dir, payload.get("ssh_public_key"))
         return {
             "prepared": True,
             "mode": "layer3",
             "layer3_path": str(layer3_path),
             "root_device": root_device,
+            "host_authorized_keys_copied": host_authorized_keys_copied,
+            "host_identity_keys_available": host_identity_keys_available,
             "ssh_public_key_added": ssh_key_added,
         }
     finally:
@@ -2033,12 +2196,54 @@ def _prepare_layer3_guest_bootstrap(config: AppConfig, payload: dict[str, Any]) 
 
 def _planned_commands(config: AppConfig, action: str, payload: dict[str, Any]) -> list[list[str]]:
     commands: list[list[str]] = []
+    if action == "wait-ssh":
+        commands.append(
+            [
+                "ssh",
+                "-F",
+                "/dev/null",
+                "-o",
+                "BatchMode=yes",
+                "-o",
+                "ControlMaster=no",
+                "-o",
+                "ControlPath=none",
+                "-o",
+                "StrictHostKeyChecking=no",
+                "-o",
+                "UserKnownHostsFile=/dev/null",
+                "-o",
+                "ConnectTimeout=10",
+                f"root@{payload['reserved_ip']}",
+                "printf kvm-control-ssh-ready",
+            ]
+        )
+        return commands
     if action == "build-base-image":
         return _planned_base_image_commands(config, payload)
     if action == "build-layer2-image":
         if _layer2_booted_builder_enabled(payload["recipe"]):
             return _planned_booted_layer2_image_commands(config, payload)
         return _planned_layer2_image_commands(config, payload)
+    if action in {"cleanup-after-boot", "cleanup-trash"}:
+        ttl_seconds = int(payload.get("ttl_seconds", config.cleanup.trash_file_ttl_seconds))
+        commands.append(
+            [
+                "find",
+                str(config.storage.trash_dir),
+                "-maxdepth",
+                "1",
+                "-type",
+                "f",
+                "-mmin",
+                f"+{max(0, ttl_seconds) // 60}",
+                "-delete",
+            ]
+        )
+        return commands
+    if action == "reconcile-runtime":
+        commands.append(["reconcile-runtime-state"])
+        return commands
     vm_id = payload["vm_id"]
     layer2_path = payload["layer2_path"]
     layer3_path = payload["layer3_path"]
@@ -2177,10 +2382,6 @@ def _planned_commands(config: AppConfig, action: str, payload: dict[str, Any]) -
         commands.append(["ipset", "flush", payload.get("ipset_name", "kvmIngressAnyV4")])
         for entry in payload.get("entries", []):
             commands.append(["ipset", "add", payload.get("ipset_name", "kvmIngressAnyV4"), entry, "-exist"])
-    elif action == "cleanup-after-boot":
-        commands.append(["find", str(config.storage.trash_dir), "-type", "f", "-name", "*.qcow2", "-delete"])
-    elif action == "reconcile-runtime":
-        commands.append(["reconcile-runtime-state", vm_id])
     elif action == "delete-runtime":
         commands.append(["rm", "-f", str(_runtime_json(config, vm_id)), str(_runtime_xml(config, vm_id))])
     return commands
@@ -2201,6 +2402,89 @@ def handle_request(config: AppConfig, action: str, payload: dict[str, Any]) -> d
             "max_total_vcpus": config.host.max_total_vcpus,
             "max_total_memory_mb": config.host.max_total_memory_mb,
         }
+
+    if action == "wait-ssh":
+        planned_commands = _planned_commands(config, action, payload)
+        _command_log(config, action, payload.get("vm_id"), planned_commands)
+        reserved_ip = str(payload["reserved_ip"])
+        timeout_s = int(payload.get("timeout_s", 15))
+        if config.dry_run:
+            return {
+                "result": "ok",
+                "reserved_ip": reserved_ip,
+                "readiness_probe": "root_ssh_command",
+                "ssh_login_verified": True,
+                "scp_verified": False,
+                "planned_commands": planned_commands,
+                "dry_run": True,
+            }
+        completed = _run_ssh(reserved_ip, "printf kvm-control-ssh-ready", timeout_s=timeout_s, check=False)
+        output = (completed.stdout or "").strip()
+        verified = completed.returncode == 0 and output == "kvm-control-ssh-ready"
+        response = {
+            "result": "ok" if verified else "not-ready",
+            "reserved_ip": reserved_ip,
+            "readiness_probe": "root_ssh_command",
+            "ssh_login_verified": verified,
+            "scp_verified": False,
+            "planned_commands": planned_commands,
+            "dry_run": False,
+        }
+        if not verified:
+            response["error"] = (completed.stderr or completed.stdout or f"ssh exited {completed.returncode}").strip()
+            response["returncode"] = completed.returncode
+        return response
+
+    if action in {"cleanup-after-boot", "cleanup-trash"}:
+        planned_commands = _planned_commands(config, action, payload)
+        _command_log(config, action, "host", planned_commands)
+        ttl_seconds = int(payload.get("ttl_seconds", config.cleanup.trash_file_ttl_seconds))
+        if ttl_seconds <= 0:
+            return {
+                "result": "ok",
+                "deleted_files": [],
+                "failed_files": [],
+                "skipped": "disabled",
+                "ttl_seconds": ttl_seconds,
+                "planned_commands": planned_commands,
+                "dry_run": config.dry_run,
+            }
+        cutoff = time.time() - ttl_seconds
+        deleted_files: list[str] = []
+        failed_files: list[dict[str, str]] = []
+        for candidate in storage.trash_dir.iterdir():
+            try:
+                if not candidate.is_file():
+                    continue
+                if candidate.stat().st_mtime > cutoff:
+                    continue
+                if not config.dry_run:
+                    candidate.unlink()
+                deleted_files.append(str(candidate))
+            except OSError as exc:
+                failed_files.append({"path": str(candidate), "error": str(exc)})
+        return {
+            "result": "ok",
+            "deleted_files": deleted_files,
+            "failed_files": failed_files,
+            "ttl_seconds": ttl_seconds,
+            "planned_commands": planned_commands,
+            "dry_run": config.dry_run,
+        }
+
+    if action == "reconcile-runtime":
+        planned_commands = _planned_commands(config, action, payload)
+        _command_log(config, action, "host", planned_commands)
+        tracked = set(payload.get("tracked_vm_ids", []))
+        deleted = 0
+        for runtime in storage.runtime_dir.glob("*.json"):
+            if runtime.stem not in tracked:
+                runtime.unlink()
+                deleted += 1
+        for runtime_xml in storage.runtime_dir.glob("*.xml"):
+            if runtime_xml.stem not in tracked:
+                runtime_xml.unlink()
+        return {"result": "ok", "deleted_runtime_files": deleted, "planned_commands": planned_commands, "dry_run": config.dry_run}
 
     if action == "build-base-image":
         planned_commands = _planned_commands(config, action, payload)
@@ -2223,7 +2507,10 @@ def handle_request(config: AppConfig, action: str, payload: dict[str, Any]) -> d
         _ensure_under(_resolve(str(storage.layer2_dir)), local_path)
         if remote_backend == "local":
             remote_path = _resolve(remote_path_value)
-            _ensure_under(_resolve(str(storage.image_remote_dir)), remote_path)
+            try:
+                _ensure_under(_resolve(str(storage.image_remote_dir)), remote_path)
+            except ValueError:
+                _ensure_under(_resolve(str(storage.layer2_dir)), remote_path)
         elif remote_backend == "rsync":
             remote_path = remote_path_value
             _parse_rsync_uri(remote_path)
@@ -2339,7 +2626,9 @@ def handle_request(config: AppConfig, action: str, payload: dict[str, Any]) -> d
         if local_meta.exists():
             local_meta.unlink()
         if remote_backend == "local":
-            if remote_path.exists():
+            if remote_path == local_path:
+                deleted_remote = deleted_local or not remote_path.exists()
+            elif remote_path.exists():
                 remote_path.unlink()
                 deleted_remote = True
             remote_meta = _meta_path(remote_path)
@@ -2435,7 +2724,7 @@ def handle_request(config: AppConfig, action: str, payload: dict[str, Any]) -> d
         if layer3_path.exists():
             return {"result": "ok", "layer3_path": str(layer3_path), "already_present": True, "planned_commands": planned_commands, "dry_run": config.dry_run}
         layer3_size_mb = payload.get("layer3_size_mb")
-        virtual_size_bytes = int(layer3_size_mb) * 1024 * 1024 if layer3_size_mb is not None else None
+        virtual_size_bytes = int(layer3_size_mb) * 1024 * 1024 if layer3_size_mb is not None else _qcow_virtual_size_bytes(layer2_path)
         _touch_qcow(layer3_path, backing_file=str(layer2_path), virtual_size_bytes=virtual_size_bytes, dry_run=config.dry_run)
         return {"result": "ok", "layer3_path": str(layer3_path), "planned_commands": planned_commands, "dry_run": config.dry_run}
 
@@ -2524,7 +2813,9 @@ def handle_request(config: AppConfig, action: str, payload: dict[str, Any]) -> d
         guest_bootstrap_result = _prepare_layer3_guest_bootstrap(config, payload)
         runtime_xml = _write_runtime_xml(config, payload)
         runtime = _runtime_json(config, vm_id)
-        if not config.dry_run and _libvirt_available():
+        if not config.dry_run:
+            if not _libvirt_available():
+                raise RuntimeError("libvirt/virsh is not available; cannot start VM outside dry-run mode")
             _require_kvm_device()
             domain_exists = _domain_exists(vm_id)
             state_before = _domain_state(vm_id) if domain_exists else None
@@ -2549,6 +2840,7 @@ def handle_request(config: AppConfig, action: str, payload: dict[str, Any]) -> d
                     "memory_mb": payload["memory_mb"],
                     "reserved_ip": payload["reserved_ip"],
                     "reserved_mac": payload["reserved_mac"],
+                    "nested_virtualization": bool(payload.get("nested_virtualization")),
                     "guest_bootstrap_script": str(guest_bootstrap_script),
                     "guest_bootstrap": guest_bootstrap_result,
                     "runtime_xml": str(runtime_xml),
@@ -2587,7 +2879,12 @@ def handle_request(config: AppConfig, action: str, payload: dict[str, Any]) -> d
         runtime = _runtime_json(config, vm_id)
         if not config.dry_run and _libvirt_available() and _domain_exists(vm_id):
             state_before = _domain_state(vm_id)
-            if state_before not in {"shut off", "shutdown", "no state"}:
+            if state_before == "paused":
+                _virsh(["destroy", vm_id])
+                state = _wait_for_domain_state(vm_id, {"shut off", "shutdown", "no state"}, 10.0)
+                if state not in {"shut off", "shutdown", "no state"}:
+                    raise RuntimeError(f"vm {vm_id} failed to power off from paused state, current state={state}")
+            elif state_before not in {"shut off", "shutdown", "no state"}:
                 _virsh(["shutdown", vm_id])
                 state = _wait_for_domain_state(vm_id, {"shut off", "shutdown", "no state"}, 90.0)
                 if state not in {"shut off", "shutdown", "no state"}:
@@ -2671,6 +2968,8 @@ def handle_request(config: AppConfig, action: str, payload: dict[str, Any]) -> d
             "domain_state": domain_state,
             "power_state": _map_domain_state(domain_state),
             "current_ip": current_ip,
+            "host_booted_at": _host_booted_at(),
+            "inspected_at": datetime.now(UTC).isoformat(),
             "planned_commands": planned_commands,
             "dry_run": config.dry_run,
         }
@@ -2734,26 +3033,6 @@ def handle_request(config: AppConfig, action: str, payload: dict[str, Any]) -> d
             if candidate.exists():
                 candidate.unlink()
                 deleted.append(str(candidate))
-        return {"result": "ok", "deleted_runtime_files": deleted, "planned_commands": planned_commands, "dry_run": config.dry_run}
-
-    if action == "cleanup-after-boot":
-        deleted = 0
-        for candidate in storage.trash_dir.glob("*.qcow2"):
-            if candidate.is_file():
-                candidate.unlink()
-                deleted += 1
-        return {"result": "ok", "deleted": deleted, "planned_commands": planned_commands, "dry_run": config.dry_run}
-
-    if action == "reconcile-runtime":
-        tracked = set(payload.get("tracked_vm_ids", []))
-        deleted = 0
-        for runtime in storage.runtime_dir.glob("*.json"):
-            if runtime.stem not in tracked:
-                runtime.unlink()
-                deleted += 1
-        for runtime_xml in storage.runtime_dir.glob("*.xml"):
-            if runtime_xml.stem not in tracked:
-                runtime_xml.unlink()
         return {"result": "ok", "deleted_runtime_files": deleted, "planned_commands": planned_commands, "dry_run": config.dry_run}
 
     raise AssertionError("unreachable")

@@ -8,6 +8,7 @@ from pathlib import Path
 
 from .db import Registry
 from .executor import ExecutorClient
+from .vm_cleanup import cleanup_stale_stopped_ephemeral_vms, cleanup_stale_trash_files
 
 
 class RunMonitor:
@@ -21,6 +22,8 @@ class RunMonitor:
         self._stop_event = threading.Event()
         self._disk_full_state: dict[tuple[int, str], bool] = {}
         self._run_disk_pressure_active: dict[int, bool] = {}
+        self._last_stale_ephemeral_cleanup_at = 0.0
+        self._last_stale_trash_cleanup_at = 0.0
 
     def start(self) -> None:
         with self._lock:
@@ -53,10 +56,34 @@ class RunMonitor:
 
     def sample_all_runs(self) -> None:
         self._shutdown_expired_namespace_leases()
+        self._cleanup_stale_stopped_ephemeral_vms()
+        self._cleanup_stale_trash_files()
         for run in self.registry.active_runs():
             disk_bytes, ram_mb, vms = self._measure_run(run)
             self.registry.record_run_usage_sample(run["id"], disk_bytes, ram_mb)
             self._detect_disk_full(run, vms)
+
+    def _cleanup_stale_stopped_ephemeral_vms(self) -> None:
+        ttl_seconds = self.registry.config.cleanup.stopped_ephemeral_vm_ttl_seconds
+        if ttl_seconds <= 0:
+            return
+        interval_s = max(60.0, float(self.registry.config.cleanup.stopped_ephemeral_vm_cleanup_interval_seconds))
+        now = time.monotonic()
+        if now - self._last_stale_ephemeral_cleanup_at < interval_s:
+            return
+        self._last_stale_ephemeral_cleanup_at = now
+        cleanup_stale_stopped_ephemeral_vms(self.registry.config, self.registry, self.executor)
+
+    def _cleanup_stale_trash_files(self) -> None:
+        ttl_seconds = self.registry.config.cleanup.trash_file_ttl_seconds
+        if ttl_seconds <= 0:
+            return
+        interval_s = max(60.0, float(self.registry.config.cleanup.trash_file_cleanup_interval_seconds))
+        now = time.monotonic()
+        if now - self._last_stale_trash_cleanup_at < interval_s:
+            return
+        self._last_stale_trash_cleanup_at = now
+        cleanup_stale_trash_files(self.registry.config, self.registry, self.executor)
 
     def _shutdown_expired_namespace_leases(self) -> None:
         for lock in self.registry.list_expired_namespace_lock_leases():

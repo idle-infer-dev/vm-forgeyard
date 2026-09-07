@@ -32,7 +32,7 @@ def main() -> int:
     elif args.service == "lock-api":
         from .lock_api import create_app as create_lock_app
 
-        app = create_lock_app(build_services(args.config))
+        app = create_lock_app(build_services(args.config, start_monitor=False))
         port = args.port or 8001
     else:
         from .config import load_config

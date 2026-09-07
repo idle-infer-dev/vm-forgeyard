@@ -7,12 +7,12 @@ from fastapi.responses import Response
 
 from .auth import AuthPrincipal, current_principal, effective_namespace, require_auth
 from .firewall import reconcile_firewall_access, reconcile_firewall_egress
-from .models import CreateLockRequest, ReleaseLockRequest
+from .models import CreateLockRequest, RefreshLeaseRequest, ReleaseLockRequest
 from .service import Services, build_services
 
 
 def create_app(services: Services | None = None) -> FastAPI:
-    services = services or build_services()
+    services = services or build_services(start_monitor=False)
     app = FastAPI(
         title="kvm-control lock-api",
         version="0.1.0",
@@ -57,7 +57,9 @@ def create_app(services: Services | None = None) -> FastAPI:
     @app.post("/v1/locks/requests", status_code=201)
     def create_lock_request(request: CreateLockRequest, principal: AuthPrincipal = Depends(current_principal)) -> dict:
         namespace = effective_namespace(principal, request.namespace)
-        record = services.registry.ensure_lock_request(request.resource_id, namespace)
+        if request.lease_ttl_seconds is not None and request.lease_ttl_seconds > services.config.leases.max_namespace_lock_ttl_seconds:
+            raise HTTPException(status_code=422, detail="lease_ttl_seconds exceeds maximum")
+        record = services.registry.ensure_lock_request(request.resource_id, namespace, ttl_seconds=request.lease_ttl_seconds)
         record = dict(record)
         record["authenticated_as"] = principal.username
         record["effective_namespace"] = record.get("namespace")
@@ -102,13 +104,16 @@ def create_app(services: Services | None = None) -> FastAPI:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
 
     @app.post("/v1/locks/requests/{request_id}/lease/refresh")
-    def refresh_lock_lease(request_id: int, principal: AuthPrincipal = Depends(current_principal)) -> dict:
+    def refresh_lock_lease(request_id: int, payload: RefreshLeaseRequest | None = None, principal: AuthPrincipal = Depends(current_principal)) -> dict:
         try:
+            payload = payload or RefreshLeaseRequest()
+            if payload.lease_ttl_seconds is not None and payload.lease_ttl_seconds > services.config.leases.max_namespace_lock_ttl_seconds:
+                raise HTTPException(status_code=422, detail="lease_ttl_seconds exceeds maximum")
             record = services.registry.get_lock_request(request_id)
             if record is None:
                 raise KeyError(request_id)
             namespace = effective_namespace(principal, record["namespace"])
-            refreshed = services.registry.refresh_lock_lease(request_id, namespace)
+            refreshed = services.registry.refresh_lock_lease(request_id, namespace, ttl_seconds=payload.lease_ttl_seconds)
             refreshed = dict(refreshed)
             refreshed["authenticated_as"] = principal.username
             refreshed["effective_namespace"] = refreshed.get("namespace")
