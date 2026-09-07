@@ -214,6 +214,19 @@ def main() -> int:
             _request("POST", f"{control_base}/v1/vms/{vm_id}/revert", expected_status=202)
             _request("POST", f"{control_base}/v1/vms/{vm_id}/start", expected_status=202)
 
+            ready = _request(
+                "POST",
+                f"{control_base}/v1/vms/{vm_id}/wait-ready",
+                {"timeout_s": 2, "poll_interval_s": 1, "check_ssh": True},
+            )
+            assert isinstance(ready, dict)
+            assert ready["ready"] is True
+            assert ready["readiness_state"] == "ready"
+            assert ready["ssh_target"] == f"root@{reserved_ip}"
+            assert ready["readiness_probe"] == "root_ssh_command"
+            assert ready["ssh_login_verified"] is True
+            assert ready["scp_verified"] is False
+
             run = _request(
                 "POST",
                 f"{control_base}/v1/runs",
@@ -343,6 +356,7 @@ def main() -> int:
             _assert_command(entries, "stop-vm", "virsh shutdown")
             _assert_command(entries, "restart-vm", "virsh reboot")
             _assert_command(entries, "revert-vm", "mv ")
+            _assert_command(entries, "wait-ssh", "ssh ")
             _assert_command(entries, "delete-layer3", "mv ")
             _assert_command(entries, "pause-vm", "virsh suspend")
             _assert_command(entries, "resume-vm", "virsh resume")
