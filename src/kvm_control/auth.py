@@ -17,6 +17,7 @@ from .config import AppConfig, AuthAclConfig
 bearer_security = HTTPBearer(auto_error=False)
 
 ALL_ZONES = ("dev", "stage", "misc", "live")
+ALL_CAPABILITIES = ("nested_kvm",)
 
 
 @dataclass(frozen=True)
@@ -25,6 +26,7 @@ class AuthPrincipal:
     role: str
     namespace: str | None
     allowed_zones: tuple[str, ...]
+    capabilities: tuple[str, ...]
     source_ip: str
     token_id: str | None = None
     authenticated: bool = True
@@ -102,6 +104,7 @@ def authenticate_request(
             role="admin",
             namespace=None,
             allowed_zones=ALL_ZONES,
+            capabilities=ALL_CAPABILITIES,
             source_ip=source_ip,
             authenticated=False,
             is_admin=True,
@@ -153,6 +156,7 @@ def _authenticate_configured_credentials(
         role=record["role"],
         namespace=record["namespace"],
         allowed_zones=(),
+        capabilities=(),
         source_ip=source_ip,
         token_id=token_id,
         is_admin=record["role"] == "admin",
@@ -173,6 +177,7 @@ def _open_mode_principal(
             role=credential.role,
             namespace=credential.namespace,
             allowed_zones=credential.allowed_zones,
+            capabilities=credential.capabilities,
             source_ip=credential.source_ip,
             token_id=credential.token_id,
             authenticated=credential.authenticated,
@@ -186,6 +191,7 @@ def _open_mode_principal(
         role="admin",
         namespace=None,
         allowed_zones=ALL_ZONES,
+        capabilities=ALL_CAPABILITIES,
         source_ip=source_ip,
         authenticated=False,
         is_admin=True,
@@ -238,6 +244,7 @@ def principal_to_dict(principal: AuthPrincipal) -> dict[str, Any]:
         "role": principal.role,
         "namespace": principal.namespace,
         "allowed_zones": list(principal.allowed_zones),
+        "capabilities": list(principal.capabilities),
         "source_ip": principal.source_ip,
         "authenticated": principal.authenticated,
         "auth_mode": principal.auth_mode,
@@ -252,6 +259,7 @@ def _credential_principal_to_dict(principal: AuthPrincipal) -> dict[str, Any]:
         "role": principal.role,
         "namespace": principal.namespace,
         "allowed_zones": list(principal.allowed_zones),
+        "capabilities": list(principal.capabilities),
         "source_ip": principal.source_ip,
         "authenticated": principal.authenticated,
     }
@@ -270,9 +278,9 @@ def resolve_source_ip(config: AppConfig, request: Request) -> str:
 
 def _authenticate_bootstrap_admin(config: AppConfig, token: str) -> AuthPrincipal | None:
     if config.auth.admin_token and hmac.compare_digest(token, config.auth.admin_token):
-        return AuthPrincipal(username="admin", role="admin", namespace=None, allowed_zones=(), source_ip="", is_admin=True)
+        return AuthPrincipal(username="admin", role="admin", namespace=None, allowed_zones=(), capabilities=(), source_ip="", is_admin=True)
     if config.auth.admin_token_hash and hmac.compare_digest(hash_token_secret(token), config.auth.admin_token_hash):
-        return AuthPrincipal(username="admin", role="admin", namespace=None, allowed_zones=(), source_ip="", is_admin=True)
+        return AuthPrincipal(username="admin", role="admin", namespace=None, allowed_zones=(), capabilities=(), source_ip="", is_admin=True)
     return None
 
 
@@ -293,11 +301,11 @@ def _authenticate_legacy_basic(config: AppConfig, authorization: str) -> AuthPri
     password_ok = hmac.compare_digest(password, config.auth.password)
     if not (username_ok and password_ok):
         raise_invalid_auth()
-    return AuthPrincipal(username=username, role="admin", namespace=None, allowed_zones=(), source_ip="", is_admin=True)
+    return AuthPrincipal(username=username, role="admin", namespace=None, allowed_zones=(), capabilities=(), source_ip="", is_admin=True)
 
 
 def _with_acl_or_403(config: AppConfig, principal: AuthPrincipal, source_ip: str) -> AuthPrincipal:
-    zones = _zones_for_principal(config.auth.acl, principal.username, principal.role, source_ip)
+    zones, capabilities = _acl_policy_for_principal(config.auth.acl, principal.username, principal.role, source_ip)
     if not zones:
         raise HTTPException(status_code=403, detail="access denied")
     return AuthPrincipal(
@@ -305,6 +313,7 @@ def _with_acl_or_403(config: AppConfig, principal: AuthPrincipal, source_ip: str
         role=principal.role,
         namespace=principal.namespace,
         allowed_zones=tuple(zones),
+        capabilities=tuple(capabilities),
         source_ip=source_ip,
         token_id=principal.token_id,
         authenticated=principal.authenticated,
@@ -315,8 +324,9 @@ def _with_acl_or_403(config: AppConfig, principal: AuthPrincipal, source_ip: str
     )
 
 
-def _zones_for_principal(acls: list[AuthAclConfig], username: str, role: str, source_ip: str) -> list[str]:
+def _acl_policy_for_principal(acls: list[AuthAclConfig], username: str, role: str, source_ip: str) -> tuple[list[str], list[str]]:
     zones: list[str] = []
+    capabilities: list[str] = []
     for acl in acls:
         if not _principal_matches(acl.users, username, role):
             continue
@@ -325,7 +335,10 @@ def _zones_for_principal(acls: list[AuthAclConfig], username: str, role: str, so
         for zone in acl.zones:
             if zone not in zones:
                 zones.append(zone)
-    return zones
+        for capability in acl.capabilities:
+            if capability not in capabilities:
+                capabilities.append(capability)
+    return zones, capabilities
 
 
 def _principal_matches(patterns: list[str], username: str, role: str) -> bool:

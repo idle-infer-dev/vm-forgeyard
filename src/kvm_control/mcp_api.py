@@ -151,11 +151,13 @@ Use this MCP server as the primary control surface for VM ordering and lifecycle
 
 Recommended sequence:
 
-1. Read `kvm-control://environments`, then choose an offered `network_id`.
+1. Read `kvm-control://environments`, then choose an offered `network_id` and inspect
+   `whoami.capabilities`.
 2. Request a namespace lock with `request_lock`, normally `resource_id=namespace:<namespace>`.
 3. If the VM needs small guest bootstrap files, upload them through the HTTP API:
    `PUT /v1/webroot-artifacts/{namespace}/{path}`. The guest can fetch them from `/{namespace}/{path}`.
-4. Call `order_vm` with `template_id`, `vm_slot`, `agent_session_id`, and the caller's `ssh_public_key`.
+4. Call `order_vm` with `template_id`, `vm_slot`, `agent_session_id`, the caller's `ssh_public_key`,
+   and any capability in `requested_capabilities` only when it is listed in `whoami.capabilities`.
 5. Call `wait_for_vm_ready` for the returned `vm_id`; with SSH checking enabled, ready means a
    non-interactive root SSH command against `reserved_ip` succeeded from the host-side executor.
 6. SSH to `root@reserved_ip`; this is the normal login unless the template or handoff says otherwise.
@@ -169,6 +171,8 @@ If `wait_for_vm_ready` returns `ready=false`, inspect `reason`, `power_state`, `
 and `reserved_ip` before retrying or cleaning up.
 Persistent SCP failure after `wait_for_vm_ready` returned `ready=true` and `ssh_login_verified=true`
 should be reported with the wait response attached.
+`nested_kvm` is the initial capability-gated VM request. It is intentionally denied unless the
+authenticated principal receives that capability through auth ACL policy.
 """
 
 
@@ -200,6 +204,11 @@ Content-Type: application/json
 The response contains a normal repository token. Write it to `./repo.auth.token` before using MCP
 tools. If the repository name already has an active token, registration fails; an admin must revoke
 or otherwise reset that repository token before self-registration can mint a replacement.
+
+After authenticating, agents should call `GET /v1/auth/whoami` or read `kvm-control://environments`.
+The `capabilities` list is the source of truth for capability-gated VM requests such as
+`requested_capabilities: ["nested_kvm"]`; ordinary repository tokens should expect this list to be
+empty unless an admin has granted additional ACL capabilities.
 """
 
 

@@ -507,6 +507,9 @@ class McpApiTests(unittest.TestCase):
         self.assertIn("order_vm", text)
         self.assertIn("agent_session_id", text)
         self.assertIn("ssh_public_key", text)
+        self.assertIn("whoami.capabilities", text)
+        self.assertIn("requested_capabilities", text)
+        self.assertIn("nested_kvm", text)
         self.assertIn("wait_for_vm_ready", text)
         self.assertIn("root@reserved_ip", text)
         self.assertIn("refresh_lease", text)
@@ -518,6 +521,9 @@ class McpApiTests(unittest.TestCase):
         self.assertIn("./repo.auth.token", text)
         self.assertIn("~/.kvm-control-self-register.key", text)
         self.assertIn("/v1/auth/repository-self-registration", text)
+        self.assertIn("whoami", text)
+        self.assertIn("requested_capabilities", text)
+        self.assertIn("nested_kvm", text)
 
     def test_read_capability_contract_resource(self) -> None:
         result = self.rpc("resources/read", {"uri": "kvm-control://contracts/capabilities.v1"})
@@ -617,6 +623,7 @@ class McpApiTests(unittest.TestCase):
                         "role": "repository",
                         "namespace": "git.repo-a",
                         "allowed_zones": ["dev"],
+                        "capabilities": [],
                         "source_ip": "192.0.2.14",
                         "authenticated": True,
                     }

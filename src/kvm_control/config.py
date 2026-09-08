@@ -459,6 +459,7 @@ class AuthAclConfig(BaseModel):
     users: list[str]
     source_cidrs: list[str] = Field(default_factory=list)
     zones: list[Literal["dev", "stage", "misc", "live"]]
+    capabilities: list[Literal["nested_kvm"]] = Field(default_factory=list)
 
 
 class AuthConfig(BaseModel):
@@ -470,7 +471,7 @@ class AuthConfig(BaseModel):
     trusted_proxy_cidrs: list[str] = Field(default_factory=list)
     acl: list[AuthAclConfig] = Field(
         default_factory=lambda: [
-            AuthAclConfig(users=["admin"], zones=["dev", "stage", "misc", "live"]),
+            AuthAclConfig(users=["admin"], zones=["dev", "stage", "misc", "live"], capabilities=["nested_kvm"]),
             AuthAclConfig(users=["dev"], zones=["dev"]),
             AuthAclConfig(users=["staging"], zones=["stage"]),
             AuthAclConfig(users=["live"], zones=["live"]),

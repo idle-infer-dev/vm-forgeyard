@@ -550,8 +550,7 @@ def create_app(services: Services | None = None) -> FastAPI:
             if not probe["supported"]:
                 reason = probe.get("reason") or "host probe failed"
                 raise HTTPException(status_code=503, detail=f"nested virtualization is not supported on this host: {reason}")
-        allowed_repository_users = {"git.kvm-control", "git.vm-forgeyard"}
-        if principal.is_admin or principal.username in allowed_repository_users:
+        if "nested_kvm" in principal.capabilities:
             return
         raise HTTPException(status_code=403, detail="nested virtualization denied")
 

@@ -1729,7 +1729,14 @@ class ApiTests(unittest.TestCase):
         self.root = Path(self.tmp.name)
         self.config_path = write_config(self.root)
         config = json.loads(self.config_path.read_text())
-        config["auth"] = {"admin_token": "admin-secret"}
+        config["auth"] = {
+            "admin_token": "admin-secret",
+            "acl": [
+                {"users": ["admin"], "zones": ["dev", "stage", "misc", "live"], "capabilities": ["nested_kvm"]},
+                {"users": ["git.kvm-control"], "zones": ["dev"], "capabilities": ["nested_kvm"]},
+                {"users": ["git.*"], "zones": ["dev"]},
+            ],
+        }
         self.config_path.write_text(json.dumps(config))
         self.services = build_services(str(self.config_path))
         self.control = TestClient(create_control_app(self.services))
@@ -1748,6 +1755,11 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(whoami.status_code, 200)
         self.assertEqual(whoami.json()["namespace"], "git.repo-a")
         self.assertEqual(whoami.json()["allowed_zones"], ["dev"])
+        self.assertEqual(whoami.json()["capabilities"], [])
+
+        admin_whoami = self.control.get("/v1/auth/whoami", headers=admin_headers)
+        self.assertEqual(admin_whoami.status_code, 200)
+        self.assertEqual(admin_whoami.json()["capabilities"], ["nested_kvm"])
 
         lock = self.lock.post("/v1/locks/requests", json={"resource_id": "repo-lock"}, headers=repo_headers)
         self.assertEqual(lock.status_code, 201)
@@ -1986,6 +1998,7 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(whoami.json()["username"], "git.repo-a")
         self.assertEqual(whoami.json()["source_ip"], "192.0.2.1")
         self.assertEqual(whoami.json()["allowed_zones"], ["dev"])
+        self.assertEqual(whoami.json()["capabilities"], [])
 
     def test_repository_self_registration_key_mints_one_repo_token(self) -> None:
         self.tmp.cleanup()
@@ -2099,6 +2112,7 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(anonymous.json()["auth_mode"], "open")
         self.assertEqual(anonymous.json()["credential_status"], "missing")
         self.assertEqual(anonymous.json()["allowed_zones"], ["dev", "stage", "misc", "live"])
+        self.assertEqual(anonymous.json()["capabilities"], ["nested_kvm"])
 
         created_token = self.control.post("/v1/admin/auth/tokens", json={"username": "git.repo-a"})
         self.assertEqual(created_token.status_code, 201)
@@ -2109,10 +2123,12 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(whoami.json()["username"], "git.repo-a")
         self.assertEqual(whoami.json()["namespace"], "git.repo-a")
         self.assertEqual(whoami.json()["allowed_zones"], ["dev"])
+        self.assertEqual(whoami.json()["capabilities"], [])
         self.assertEqual(whoami.json()["auth_mode"], "open")
         self.assertEqual(whoami.json()["credential_status"], "valid")
         self.assertEqual(whoami.json()["credential_principal"]["username"], "git.repo-a")
         self.assertEqual(whoami.json()["credential_principal"]["allowed_zones"], ["dev"])
+        self.assertEqual(whoami.json()["credential_principal"]["capabilities"], [])
 
         lock = self.lock.post(
             "/v1/locks/requests",
@@ -2211,6 +2227,7 @@ class ApiTests(unittest.TestCase):
         self.assertIsNone(whoami.json()["namespace"])
         self.assertEqual(whoami.json()["role"], "dev")
         self.assertEqual(whoami.json()["allowed_zones"], ["dev"])
+        self.assertEqual(whoami.json()["capabilities"], [])
 
         lock = self.lock.post(
             "/v1/locks/requests",

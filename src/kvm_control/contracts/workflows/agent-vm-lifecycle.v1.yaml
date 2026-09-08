@@ -35,6 +35,10 @@ auth:
   token_header: "Authorization: Bearer <repository-token>"
   namespace_scope: Repository tokens may operate only in their own git.<repository> namespace.
   required_order_field: agent_session_id
+  optional_capabilities:
+    - id: nested_kvm
+      request_field: requested_capabilities
+      policy: Requires the authenticated principal to receive nested_kvm through auth ACL capabilities.
 preconditions:
   - level: MUST
     text: The agent has a repository bearer token accepted for its namespace and source address.
@@ -48,6 +52,8 @@ preconditions:
     text: The VM order includes the caller's ssh_public_key so the agent can log in after readiness.
   - level: SHOULD
     text: The agent holds resource_id namespace:<namespace> while creating and using VMs.
+  - level: MUST
+    text: A VM order that includes requested_capabilities nested_kvm uses a token whose whoami.capabilities includes nested_kvm.
 steps:
   - id: inspect-environment
     actor: repository-agent
@@ -59,7 +65,7 @@ steps:
     expected: The lock is granted or a queue/lock-blocked status is returned.
   - id: order-vm
     actor: repository-agent
-    action: Call order_vm with namespace, template_id, vm_slot, agent_session_id, network_id, and optional ssh_public_key.
+    action: Call order_vm with namespace, template_id, vm_slot, agent_session_id, network_id, optional ssh_public_key, and optional requested_capabilities.
     expected: The control API creates or reuses the namespace/template layer2, creates a per-VM layer3, starts the VM, and returns reserved_ip.
   - id: wait-ready
     actor: repository-agent
@@ -82,6 +88,7 @@ success_criteria:
   - wait_for_vm_ready reports ready only after a non-interactive root SSH command against reserved_ip succeeds when SSH checking is enabled.
   - wait_for_vm_ready responses expose that the readiness_probe is root_ssh_command, SSH login is verified, and SCP is not separately verified by the API.
   - Repository tokens cannot manage VMs outside their own namespace.
+  - Repository tokens cannot receive nested_kvm unless an auth ACL grants that capability.
   - Namespace-lock lease refresh works through MCP and HTTP.
   - Stale trash files are physically removed after cleanup.trash_file_ttl_seconds.
 bug_indicators:
@@ -91,18 +98,21 @@ bug_indicators:
   - SCP to ssh_target is refused after wait_for_vm_ready returned ready=true and ssh_login_verified=true.
   - reserved_ip for an ordered VM is inside the configured dynamic DHCP pool for its network segment.
   - A repository token can create, mutate, or delete VMs in a different namespace.
+  - A repository token without whoami.capabilities nested_kvm can create a VM with requested_capabilities nested_kvm.
   - The cleanup worker leaves direct trash files older than cleanup.trash_file_ttl_seconds in place after a cleanup pass.
 feature_request_indicators:
   - The report asks for non-FIFO scheduling, priority queues, or fairness tuning beyond current lock behavior.
   - The report asks for readiness based on application-level health checks instead of reserved-IP SSH readiness.
   - The report asks for wait_for_vm_ready to verify application-level readiness beyond root SSH command execution.
   - The report asks for wait_for_vm_ready to separately verify SCP transfer or SFTP subsystem availability.
+  - The report asks for a new VM capability that is not listed in the order_vm requested_capabilities enum.
   - The report asks to use current_ip as the normal target or expose temporary DHCP addressing as a stable API contract.
   - The report asks for recursive trash cleanup of directories rather than direct file cleanup in storage.trash_dir.
 documentation_gap_indicators:
   - The agent cannot discover that agent_session_id is required before calling order_vm.
   - The agent cannot discover that root@reserved_ip is the normal SSH target.
   - The agent cannot discover that wait_for_vm_ready verifies a root SSH command but does not separately verify SCP.
+  - The agent cannot discover through whoami.capabilities whether nested_kvm may be requested.
   - README, MCP concept resources, and this workflow disagree on lock, readiness, or cleanup behavior.
 related:
   mcp_resources:
