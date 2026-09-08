@@ -417,6 +417,8 @@ def _tools(context: dict[str, Any] | None = None) -> list[dict[str, Any]]:
     allowed_zones = (context or {}).get("allowed_zones") or ["dev", "stage", "misc", "live"]
     default_network = "dev" if "dev" in allowed_zones else allowed_zones[0]
     principal_namespace = ((context or {}).get("whoami") or {}).get("namespace")
+    principal_capabilities = ((context or {}).get("whoami") or {}).get("capabilities") or []
+    capability_hint = ", ".join(principal_capabilities) if principal_capabilities else "none"
     namespace_required = principal_namespace is None
     namespace_required_fields = ["namespace"] if namespace_required else []
     return [
@@ -465,7 +467,9 @@ def _tools(context: dict[str, Any] | None = None) -> list[dict[str, Any]]:
                 "present in the image and may fail. Use layer3_size_mb when a test needs a larger root disk virtual "
                 "size from first boot. agent_session_id is required so the VM can be traced "
                 "back to the requesting agent session. requested_capabilities can include nested_kvm for privileged "
-                "callers; nested_virtualization remains a backwards-compatible boolean for the same capability. "
+                "callers; compare requests with whoami.capabilities before asking for gated capabilities. "
+                f"Current token capabilities: {capability_hint}. "
+                "nested_virtualization remains a backwards-compatible boolean for the same capability. "
                 "By default the VM is started immediately. "
                 "After ordering, call wait_for_vm_ready before using SSH."
             ),
@@ -493,6 +497,11 @@ def _tools(context: dict[str, Any] | None = None) -> list[dict[str, Any]]:
                         "type": "array",
                         "items": {"type": "string", "enum": ["nested_kvm"]},
                         "uniqueItems": True,
+                        "description": (
+                            "Optional VM capabilities to request. nested_kvm requires nested_kvm in "
+                            "whoami.capabilities; otherwise the control API rejects the order."
+                        ),
+                        "x-kvm-control-current-capabilities": principal_capabilities,
                     },
                     "nested_virtualization": {"type": "boolean", "default": False},
                     "ssh_public_key": {

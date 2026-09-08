@@ -173,11 +173,14 @@ class McpApiTests(unittest.TestCase):
         self.assertIn("ssh_public_key", order_vm["inputSchema"]["properties"])
         self.assertIn("requested_capabilities", order_vm["inputSchema"]["properties"])
         self.assertEqual(order_vm["inputSchema"]["properties"]["requested_capabilities"]["items"]["enum"], ["nested_kvm"])
+        self.assertEqual(order_vm["inputSchema"]["properties"]["requested_capabilities"]["x-kvm-control-current-capabilities"], [])
+        self.assertIn("whoami.capabilities", order_vm["inputSchema"]["properties"]["requested_capabilities"]["description"])
         self.assertIn("nested_virtualization", order_vm["inputSchema"]["properties"])
         self.assertIn("agent_session_id", order_vm["inputSchema"]["required"])
         self.assertIn("agent_session_id is required", order_vm["description"])
         self.assertIn("ssh_public_key", order_vm["description"])
         self.assertIn("requested_capabilities", order_vm["description"])
+        self.assertIn("Current token capabilities", order_vm["description"])
         self.assertIn("nested_virtualization", order_vm["description"])
         self.assertIn("reserved_ip", order_vm["description"])
         self.assertIn("root@reserved_ip", order_vm["description"])
@@ -651,6 +654,7 @@ class McpApiTests(unittest.TestCase):
         )
         order_vm = next(tool for tool in response.json()["result"]["tools"] if tool["name"] == "order_vm")
         self.assertEqual(order_vm["inputSchema"]["properties"]["network_id"]["enum"], ["dev"])
+        self.assertEqual(order_vm["inputSchema"]["properties"]["requested_capabilities"]["x-kvm-control-current-capabilities"], [])
 
 
 if __name__ == "__main__":

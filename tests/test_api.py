@@ -2000,6 +2000,67 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(whoami.json()["allowed_zones"], ["dev"])
         self.assertEqual(whoami.json()["capabilities"], [])
 
+    def test_nested_kvm_requires_acl_capability_not_repository_name(self) -> None:
+        self.tmp.cleanup()
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+        self.config_path = write_config(self.root)
+        config = json.loads(self.config_path.read_text())
+        config["auth"] = {
+            "admin_token": "admin-secret",
+            "acl": [
+                {"users": ["admin"], "zones": ["dev", "stage", "misc", "live"], "capabilities": ["nested_kvm"]},
+                {"users": ["git.*"], "zones": ["dev"]},
+            ],
+        }
+        self.config_path.write_text(json.dumps(config))
+        self.services = build_services(str(self.config_path))
+        self.control = TestClient(create_control_app(self.services))
+        self.lock = TestClient(create_lock_app(self.services))
+        admin_headers = {"Authorization": "Bearer admin-secret"}
+
+        created_token = self.control.post(
+            "/v1/admin/auth/tokens",
+            json={"username": "git.kvm-control"},
+            headers=admin_headers,
+        )
+        self.assertEqual(created_token.status_code, 201)
+        repo_headers = {"Authorization": f"Bearer {created_token.json()['token']}"}
+        whoami = self.control.get("/v1/auth/whoami", headers=repo_headers)
+        self.assertEqual(whoami.status_code, 200)
+        self.assertEqual(whoami.json()["username"], "git.kvm-control")
+        self.assertEqual(whoami.json()["capabilities"], [])
+
+        explicit = self.control.post(
+            "/v1/vms",
+            json={
+                "template_id": "ubuntu-24.04",
+                "vm_slot": "explicit-nested-denied",
+                "network_id": "dev",
+                "autostart": False,
+                "agent_session_id": "pytest-auth-session",
+                "requested_capabilities": ["nested_kvm"],
+            },
+            headers=repo_headers,
+        )
+        self.assertEqual(explicit.status_code, 403)
+        self.assertEqual(explicit.json()["detail"], "nested virtualization denied")
+
+        legacy = self.control.post(
+            "/v1/vms",
+            json={
+                "template_id": "ubuntu-24.04",
+                "vm_slot": "legacy-nested-denied",
+                "network_id": "dev",
+                "autostart": False,
+                "agent_session_id": "pytest-auth-session",
+                "nested_virtualization": True,
+            },
+            headers=repo_headers,
+        )
+        self.assertEqual(legacy.status_code, 403)
+        self.assertEqual(legacy.json()["detail"], "nested virtualization denied")
+
     def test_repository_self_registration_key_mints_one_repo_token(self) -> None:
         self.tmp.cleanup()
         self.tmp = tempfile.TemporaryDirectory()
