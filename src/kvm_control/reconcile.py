@@ -78,16 +78,25 @@ def reconcile_registered_vm_runtime_states(services) -> dict[str, Any]:
             )
             updates: dict[str, Any] = {}
             power_state = result.get("power_state")
+            delete_requested = vm.get("status") == "deleting"
             if power_state == "running":
-                updates.update(power_state="running", status="running", stopped_at=None)
+                updates.update(power_state="running", stopped_at=None)
+                if not delete_requested:
+                    updates["status"] = "running"
             elif power_state == "paused":
-                updates.update(power_state="paused", status="paused", stopped_at=None)
+                updates.update(power_state="paused", stopped_at=None)
+                if not delete_requested:
+                    updates["status"] = "paused"
             elif power_state == "stopped":
                 stopped_at = _stopped_at_for_inspected_state(vm, result)
-                updates.update(power_state="stopped", status="stopped", readiness_state="configuring", stopped_at=stopped_at)
+                updates.update(power_state="stopped", readiness_state="configuring", stopped_at=stopped_at)
+                if not delete_requested:
+                    updates["status"] = "stopped"
             elif power_state == "failed":
                 stopped_at = _stopped_at_for_inspected_state(vm, result)
-                updates.update(power_state="failed", status="failed", readiness_state="failed", stopped_at=stopped_at)
+                updates.update(power_state="failed", readiness_state="failed", stopped_at=stopped_at)
+                if not delete_requested:
+                    updates["status"] = "failed"
             if updates:
                 services.registry.patch_vm(vm["vm_id"], **updates)
             services.registry.update_operation(operation_id, "completed", details=result)

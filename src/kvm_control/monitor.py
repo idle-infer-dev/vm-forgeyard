@@ -65,8 +65,6 @@ class RunMonitor:
 
     def _cleanup_stale_stopped_ephemeral_vms(self) -> None:
         ttl_seconds = self.registry.config.cleanup.stopped_ephemeral_vm_ttl_seconds
-        if ttl_seconds <= 0:
-            return
         interval_s = max(60.0, float(self.registry.config.cleanup.stopped_ephemeral_vm_cleanup_interval_seconds))
         now = time.monotonic()
         if now - self._last_stale_ephemeral_cleanup_at < interval_s:

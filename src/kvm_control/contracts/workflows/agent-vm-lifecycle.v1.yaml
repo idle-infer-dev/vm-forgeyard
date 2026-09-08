@@ -82,7 +82,7 @@ steps:
   - id: cleanup
     actor: repository-agent
     action: Stop, retain, archive, promote, delete, or release the VM and release the namespace lock when done.
-    expected: Disposable layer3 state is moved to trash and physically removed by background cleanup after the configured TTL.
+    expected: Disposable layer3 state is moved to trash and physically removed by background cleanup after the configured TTL. Deferred delete marks the VM as deleting and leaves the layer3 image present until cleanup performs the physical stop and trash move.
 success_criteria:
   - order_vm requires agent_session_id through MCP and forwards the request to the control API.
   - wait_for_vm_ready reports ready only after a non-interactive root SSH command against reserved_ip succeeds when SSH checking is enabled.
@@ -91,6 +91,8 @@ success_criteria:
   - Repository tokens cannot receive nested_kvm unless an auth ACL grants that capability.
   - Namespace-lock lease refresh works through MCP and HTTP.
   - Stale trash files are physically removed after cleanup.trash_file_ttl_seconds.
+  - delete_vm with wait_for_completion=false returns after marking the VM deleting; cleanup later removes the VM and moves its layer3 image to trash.
+  - Testsuites that need reclaimed VM capacity or layer3 disk space can wait for completion through wait_for_completion=true or wait_for_operation.
 bug_indicators:
   - get_capacity or other operational MCP calls return 403 for a token that direct HTTP accepts from the same effective source.
   - wait_for_vm_ready returns ready=true while a non-interactive root SSH command against reserved_ip fails with SSH checking enabled.
@@ -100,6 +102,8 @@ bug_indicators:
   - A repository token can create, mutate, or delete VMs in a different namespace.
   - A repository token without whoami.capabilities nested_kvm can create a VM with requested_capabilities nested_kvm.
   - The cleanup worker leaves direct trash files older than cleanup.trash_file_ttl_seconds in place after a cleanup pass.
+  - delete_vm with wait_for_completion=false blocks on guest shutdown or physical layer3 deletion.
+  - A VM marked deleting is reported ready by wait_for_vm_ready.
 feature_request_indicators:
   - The report asks for non-FIFO scheduling, priority queues, or fairness tuning beyond current lock behavior.
   - The report asks for readiness based on application-level health checks instead of reserved-IP SSH readiness.
@@ -127,6 +131,8 @@ related:
     - release_lock
     - order_vm
     - wait_for_vm_ready
+    - get_operation
+    - wait_for_operation
     - set_vm_retention
     - list_archived_vms
   http_paths:
@@ -137,6 +143,7 @@ related:
     - POST /v1/vms
     - POST /v1/vms/{vm_id}/wait-ready
     - POST /v1/vms/{vm_id}/retention
+    - GET /v1/operations/{operation_id}
     - DELETE /v1/vms/{vm_id}
   files:
     - src/kvm_control/control_api.py

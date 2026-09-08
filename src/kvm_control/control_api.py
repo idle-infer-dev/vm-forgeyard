@@ -419,6 +419,7 @@ def create_app(services: Services | None = None) -> FastAPI:
         rejection_category: str | None = None,
         rejection_reason: str | None = None,
         executor_results: list[dict] | None = None,
+        layer3_disposition: dict | None = None,
     ) -> VmActionResponse:
         return VmActionResponse(
             operation_id=operation_id,
@@ -434,7 +435,7 @@ def create_app(services: Services | None = None) -> FastAPI:
             dry_run=any(result.get("dry_run") for result in executor_results or []),
             planned_commands=_flatten_planned_commands(executor_results),
             executor_results=executor_results or [],
-            layer3_disposition=_layer3_disposition(executor_results),
+            layer3_disposition=layer3_disposition if layer3_disposition is not None else _layer3_disposition(executor_results),
             retention=vm.get("retention") or "ephemeral",
             retention_reason=vm.get("retention_reason"),
             purpose=vm.get("purpose"),
@@ -638,19 +639,24 @@ def create_app(services: Services | None = None) -> FastAPI:
             result = services.executor.run("inspect-vm", _vm_executor_payload(vm, operation_id))
             updates: dict[str, str | None] = {}
             power_state = result.get("power_state")
+            delete_requested = vm.get("status") == "deleting"
             if power_state == "running":
                 updates["power_state"] = "running"
-                updates["status"] = "running"
+                if not delete_requested:
+                    updates["status"] = "running"
             elif power_state == "paused":
                 updates["power_state"] = "paused"
-                updates["status"] = "paused"
+                if not delete_requested:
+                    updates["status"] = "paused"
             elif power_state == "stopped":
                 updates["power_state"] = "stopped"
-                updates["status"] = "stopped"
+                if not delete_requested:
+                    updates["status"] = "stopped"
                 updates["readiness_state"] = "configuring"
             elif power_state == "failed":
                 updates["power_state"] = "failed"
-                updates["status"] = "failed"
+                if not delete_requested:
+                    updates["status"] = "failed"
                 updates["readiness_state"] = "failed"
             if updates:
                 vm = services.registry.patch_vm(vm["vm_id"], **updates)
@@ -2300,6 +2306,8 @@ def create_app(services: Services | None = None) -> FastAPI:
         while True:
             vm = _sync_vm_runtime_state(_load_vm(vm_id))
             _require_vm_access(vm, principal)
+            if vm["status"] == "deleting":
+                return _wait_ready_response(vm, ready=False, started_at=started_at, reason="VM is queued for deletion")
             if vm["readiness_state"] == "ready" and not payload.check_ssh:
                 return _wait_ready_response(vm, ready=True, started_at=started_at, ssh_login_verified=False)
             if vm["readiness_state"] == "failed" or vm["power_state"] == "failed":
@@ -2577,11 +2585,48 @@ def create_app(services: Services | None = None) -> FastAPI:
         return updated
 
     @api.delete("/v1/vms/{vm_id}", response_model=VmActionResponse, status_code=202)
-    def delete_vm(vm_id: str, keep_layer2: bool = True, principal: AuthPrincipal = Depends(current_principal)) -> VmActionResponse:
+    def delete_vm(vm_id: str, keep_layer2: bool = True, wait: bool = True, principal: AuthPrincipal = Depends(current_principal)) -> VmActionResponse:
         vm = _load_vm(vm_id)
         _require_vm_access(vm, principal)
         if not keep_layer2 and vm.get("source_image_id"):
             raise HTTPException(status_code=422, detail="cannot delete shared prepared image through vm delete; delete the image separately")
+        if not wait and not keep_layer2:
+            raise HTTPException(status_code=422, detail="wait=false currently supports only keep_layer2=true")
+        if not wait:
+            operation_id = services.registry.create_operation(
+                "delete-deferred",
+                vm_id,
+                vm["namespace"],
+                "running",
+                details={"keep_layer2": keep_layer2, "cleanup_reason": "vm_delete_deferred"},
+            )
+            updated = services.registry.patch_vm(
+                vm_id,
+                status="deleting",
+                readiness_state="configuring",
+                pause_reason=None,
+                retention="ephemeral",
+                retention_reason="deferred delete requested",
+            )
+            services.registry.update_operation(
+                operation_id,
+                "completed",
+                details={"keep_layer2": keep_layer2, "cleanup_reason": "vm_delete_deferred", "completion_deferred": True},
+            )
+            layer3_path = Path(vm["layer3_path"])
+            return response_for(
+                updated,
+                operation_id,
+                "delete",
+                "completed",
+                layer3_disposition={
+                    "mode": "deferred",
+                    "layer3_path": str(layer3_path),
+                    "layer3_path_exists_after": layer3_path.exists(),
+                    "trash_path": None,
+                    "trash_path_exists_after": None,
+                },
+            )
         vm_response_snapshot = dict(vm)
         operation_id = services.registry.create_operation("delete", vm_id, vm["namespace"], "running")
         executor_results: list[dict] = []

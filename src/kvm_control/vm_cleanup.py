@@ -39,12 +39,14 @@ def cleanup_stale_stopped_ephemeral_vms(config: AppConfig, registry: Registry, e
     now = datetime.now(UTC)
     candidates = []
     for vm in registry.list_stopped_ephemeral_vms():
+        delete_requested = vm.get("status") == "deleting"
         reference_time = _stopped_reference_time(vm)
-        if reference_time is None:
+        if reference_time is None and not delete_requested:
             continue
-        if reference_time <= now - timedelta(seconds=ttl_seconds):
+        if delete_requested or (ttl_seconds > 0 and reference_time is not None and reference_time <= now - timedelta(seconds=ttl_seconds)):
             vm = dict(vm)
-            vm["stopped_reference_at"] = reference_time.isoformat()
+            vm["stopped_reference_at"] = reference_time.isoformat() if reference_time is not None else None
+            vm["cleanup_reason"] = "vm_delete_deferred" if delete_requested else "stopped_ephemeral_vm_ttl_expired"
             candidates.append(vm)
     cleaned: list[dict[str, Any]] = []
     failed: list[dict[str, Any]] = []
@@ -55,7 +57,7 @@ def cleanup_stale_stopped_ephemeral_vms(config: AppConfig, registry: Registry, e
             vm_id,
             vm["namespace"],
             "running",
-            details={"stopped_reference_at": vm["stopped_reference_at"], "ttl_seconds": ttl_seconds},
+            details={"stopped_reference_at": vm["stopped_reference_at"], "ttl_seconds": ttl_seconds, "cleanup_reason": vm["cleanup_reason"]},
         )
         try:
             executor.run(
@@ -81,11 +83,12 @@ def cleanup_stale_stopped_ephemeral_vms(config: AppConfig, registry: Registry, e
                 registry.record_archived_vm(
                     vm,
                     trashed_path=trashed_path,
-                    reason="stopped_ephemeral_vm_ttl_expired",
+                    reason=vm["cleanup_reason"],
                     metadata={
                         "operation_id": operation_id,
                         "ttl_seconds": ttl_seconds,
                         "stopped_reference_at": vm["stopped_reference_at"],
+                        "cleanup_reason": vm["cleanup_reason"],
                     },
                 )
             executor.run(
@@ -109,7 +112,7 @@ def cleanup_stale_stopped_ephemeral_vms(config: AppConfig, registry: Registry, e
                 summary=f"deleted stale stopped ephemeral vm {vm_id}",
                 details={"stopped_reference_at": vm["stopped_reference_at"], "ttl_seconds": ttl_seconds},
             )
-            cleaned.append({"vm_id": vm_id, "namespace": vm["namespace"], "stopped_reference_at": vm["stopped_reference_at"]})
+            cleaned.append({"vm_id": vm_id, "namespace": vm["namespace"], "stopped_reference_at": vm["stopped_reference_at"], "cleanup_reason": vm["cleanup_reason"]})
         except Exception as exc:
             registry.update_operation(operation_id, "failed", rejection_reason=str(exc))
             registry.record_status_event(

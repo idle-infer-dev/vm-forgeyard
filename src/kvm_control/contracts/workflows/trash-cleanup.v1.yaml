@@ -4,7 +4,8 @@ status: implemented
 summary: >
   VM destructive operations move direct files into storage.trash_dir first, and
   background cleanup physically removes stale direct trash files after the
-  configured TTL.
+  configured TTL. Deferred VM deletion marks the VM deleting and lets cleanup
+  perform the later physical stop and layer3 trash move.
 classification:
   purpose: >
     Distinguish broken trash enforcement from requests for broader storage
@@ -49,6 +50,10 @@ steps:
     actor: root-vm-exec
     action: Move a discarded layer file into storage.trash_dir during delete, revert, or cleanup.
     expected: The foreground operation completes without waiting for slow physical deletion.
+  - id: deferred-vm-delete
+    actor: control-api
+    action: Mark an ephemeral VM deleting when delete is requested without waiting for completion.
+    expected: The VM remains registered with layer3_presence present until cleanup stops it, moves the layer3 image to trash, and removes the registry row.
   - id: monitor-cleanup
     actor: monitor
     action: Periodically run trash cleanup according to cleanup.trash_file_cleanup_interval_seconds.
@@ -61,6 +66,7 @@ success_criteria:
   - root-vm-exec exposes a cleanup-trash action.
   - Monitor and startup reconcile run stale trash cleanup.
   - Direct regular files older than cleanup.trash_file_ttl_seconds are deleted after cleanup.
+  - VMs marked deleting are selected by VM cleanup without waiting for stopped_ephemeral_vm_ttl_seconds.
   - Newer direct trash files are preserved until their TTL expires.
   - Directories under storage.trash_dir are not recursively deleted by the first implementation.
 bug_indicators:
@@ -68,6 +74,8 @@ bug_indicators:
   - Startup reconciliation does not remove stale direct trash files.
   - cleanup-trash deletes direct regular files younger than cleanup.trash_file_ttl_seconds.
   - VM delete or revert blocks on slow physical deletion instead of moving the file to trash first.
+  - A VM marked deleting is ignored by VM cleanup.
+  - Deferred delete reports the layer3 image trashed before cleanup has moved it.
 feature_request_indicators:
   - The report asks for recursive deletion of directories under storage.trash_dir.
   - The report asks for cleanup based on disk pressure rather than configured file age.
@@ -82,9 +90,11 @@ related:
     - kvm-control://concepts/agent-workflow
   mcp_tools:
     - delete_vm
+    - wait_for_operation
     - wait_for_vm_ready
   http_paths:
     - DELETE /v1/vms/{vm_id}
+    - GET /v1/operations/{operation_id}
     - POST /v1/vms/{vm_id}/revert
   files:
     - src/kvm_control/vm_cleanup.py

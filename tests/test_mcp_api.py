@@ -7,14 +7,14 @@ from unittest.mock import patch
 import yaml
 from fastapi.testclient import TestClient
 
-from kvm_control.mcp_api import create_app
+from kvm_control.mcp_api import LIFECYCLE_UPSTREAM_TIMEOUT_S, create_app
 
 
 class FakeKvmClient:
     def __init__(self) -> None:
         self.calls: list[tuple[str, str, object]] = []
 
-    def get_control(self, path: str, query: dict | None = None):
+    def get_control(self, path: str, query: dict | None = None, timeout_s: int | None = None):
         self.calls.append(("get_control", path, query))
         if path == "/v1/templates":
             return [{"template_id": "devuan-daedalus"}]
@@ -65,9 +65,11 @@ class FakeKvmClient:
             ]
         if path == "/v1/vms/vm-a":
             return {"vm_id": "vm-a", "power_state": "running"}
+        if path == "/v1/operations/42":
+            return {"id": 42, "status": "completed", "action": "delete"}
         raise AssertionError(path)
 
-    def post_control(self, path: str, payload: dict | None = None):
+    def post_control(self, path: str, payload: dict | None = None, timeout_s: int | None = None):
         self.calls.append(("post_control", path, payload))
         if path == "/v1/vms":
             return {"vm_id": "repo-a-node1", "status": "completed", "reserved_ip": "10.80.1.23", "payload": payload}
@@ -95,21 +97,21 @@ class FakeKvmClient:
             return {"id": 12, "payload": payload}
         raise AssertionError(path)
 
-    def delete_control(self, path: str):
-        self.calls.append(("delete_control", path, None))
+    def delete_control(self, path: str, query: dict | None = None, timeout_s: int | None = None):
+        self.calls.append(("delete_control", path, query))
         if path == "/v1/firewall/egress-rules/10":
             return {"deleted": {"id": 10}}
         if path == "/v1/firewall/access-rules/11":
             return {"deleted": {"id": 11}}
         if path == "/v1/endpoint-workarounds/12":
             return {"deleted": {"id": 12}}
-        return {"vm_id": path.rsplit("/", 1)[-1], "action": "delete"}
+        return {"vm_id": path.rsplit("/", 1)[-1], "action": "delete", "query": query}
 
-    def get_lock(self, path: str, query: dict | None = None):
+    def get_lock(self, path: str, query: dict | None = None, timeout_s: int | None = None):
         self.calls.append(("get_lock", path, query))
         return []
 
-    def post_lock(self, path: str, payload: dict | None = None):
+    def post_lock(self, path: str, payload: dict | None = None, timeout_s: int | None = None):
         self.calls.append(("post_lock", path, payload))
         if path == "/v1/locks/requests":
             return {"id": 1, "status": "granted"}
@@ -340,6 +342,29 @@ class McpApiTests(unittest.TestCase):
         )
         self.assertEqual(result["result"]["structuredContent"]["action"], "resize-layer3")
         self.assertIn(("post_control", "/v1/vms/vm-a/resize-layer3", {"new_size_mb": 4096}), self.fake.calls)
+
+    def test_delete_vm_forwards_completion_preference(self) -> None:
+        deferred = self.rpc(
+            "tools/call",
+            {
+                "name": "delete_vm",
+                "arguments": {
+                    "vm_id": "vm-a",
+                    "wait_for_completion": False,
+                },
+            },
+        )
+
+        self.assertEqual(deferred["result"]["structuredContent"]["query"], {"wait": False, "keep_layer2": True})
+        self.assertIn(("delete_control", "/v1/vms/vm-a", {"wait": False, "keep_layer2": True}), self.fake.calls)
+
+    def test_operation_tools_forward_to_control_api(self) -> None:
+        fetched = self.rpc("tools/call", {"name": "get_operation", "arguments": {"operation_id": 42}})
+        waited = self.rpc("tools/call", {"name": "wait_for_operation", "arguments": {"operation_id": 42, "timeout_s": 0}})
+
+        self.assertEqual(fetched["result"]["structuredContent"]["status"], "completed")
+        self.assertEqual(waited["result"]["structuredContent"]["status"], "completed")
+        self.assertFalse(waited["result"]["structuredContent"]["timed_out"])
 
     def test_retention_and_archive_tools_forward_to_control_api(self) -> None:
         retained = self.rpc(
@@ -655,6 +680,38 @@ class McpApiTests(unittest.TestCase):
         order_vm = next(tool for tool in response.json()["result"]["tools"] if tool["name"] == "order_vm")
         self.assertEqual(order_vm["inputSchema"]["properties"]["network_id"]["enum"], ["dev"])
         self.assertEqual(order_vm["inputSchema"]["properties"]["requested_capabilities"]["x-kvm-control-current-capabilities"], [])
+
+    def test_lifecycle_tools_use_longer_upstream_timeout(self) -> None:
+        class Response:
+            def __init__(self, payload: dict) -> None:
+                self.payload = payload
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args) -> None:
+                return None
+
+            def read(self) -> bytes:
+                return json.dumps(self.payload).encode("utf-8")
+
+        captured: list[int] = []
+
+        def fake_urlopen(request, timeout: int = 30):
+            captured.append(timeout)
+            self.assertEqual(request.full_url, "http://control/v1/vms/vm-a/stop")
+            return Response({"vm_id": "vm-a", "action": "stop"})
+
+        client = TestClient(create_app(control_url="http://control", lock_url="http://lock"))
+        with patch("kvm_control.mcp_api.urlopen", fake_urlopen):
+            response = client.post(
+                "/mcp",
+                json={"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": "stop_vm", "arguments": {"vm_id": "vm-a"}}},
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["result"]["structuredContent"]["action"], "stop")
+        self.assertEqual(captured, [LIFECYCLE_UPSTREAM_TIMEOUT_S])
 
 
 if __name__ == "__main__":

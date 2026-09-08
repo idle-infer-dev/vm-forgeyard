@@ -4,6 +4,7 @@ import base64
 import importlib.resources
 import json
 import os
+import time
 from dataclasses import dataclass
 from typing import Any
 from urllib.error import HTTPError, URLError
@@ -17,6 +18,10 @@ from kvm_control.contracts.reporting import ContractReportInput, draft_contract_
 
 
 MCP_PROTOCOL_VERSION = "2025-06-18"
+DEFAULT_UPSTREAM_TIMEOUT_S = 30
+LIFECYCLE_UPSTREAM_TIMEOUT_S = 180
+IMAGE_LIFECYCLE_UPSTREAM_TIMEOUT_S = 600
+WAIT_READY_UPSTREAM_TIMEOUT_MARGIN_S = 30
 
 
 LAYER_CONCEPT_TEXT = """# kvm-control VM image model
@@ -164,6 +169,9 @@ Recommended sequence:
 7. Do not use `current_ip` as the normal target.
 8. Refresh the namespace lock lease with `refresh_lease` while the VM is in active use.
 9. Stop, resize, promote, retain, archive, or delete the VM through MCP lifecycle tools.
+   For disposable VMs, delete_vm may use wait_for_completion=false to mark the VM for asynchronous
+   cleanup and return immediately. If a testsuite needs freed VM capacity or layer3 disk space before
+   continuing, use wait_for_completion=true or poll the returned operation with wait_for_operation.
 10. Release the lock with `release_lock` when the namespace no longer needs protection.
 
 If `ssh_public_key` is omitted, SSH access depends on keys already present in the image and may fail.
@@ -255,22 +263,22 @@ class KvmControlHttpClient:
     token: str | None = None
     username: str | None = None
     password: str | None = None
-    timeout_s: int = 30
+    timeout_s: int = DEFAULT_UPSTREAM_TIMEOUT_S
 
-    def get_control(self, path: str, query: dict[str, Any] | None = None) -> Any:
-        return self._request("GET", self.control_url, path, query=query)
+    def get_control(self, path: str, query: dict[str, Any] | None = None, timeout_s: int | None = None) -> Any:
+        return self._request("GET", self.control_url, path, query=query, timeout_s=timeout_s)
 
-    def post_control(self, path: str, payload: dict[str, Any] | None = None) -> Any:
-        return self._request("POST", self.control_url, path, payload=payload or {})
+    def post_control(self, path: str, payload: dict[str, Any] | None = None, timeout_s: int | None = None) -> Any:
+        return self._request("POST", self.control_url, path, payload=payload or {}, timeout_s=timeout_s)
 
-    def delete_control(self, path: str) -> Any:
-        return self._request("DELETE", self.control_url, path)
+    def delete_control(self, path: str, query: dict[str, Any] | None = None, timeout_s: int | None = None) -> Any:
+        return self._request("DELETE", self.control_url, path, query=query, timeout_s=timeout_s)
 
-    def get_lock(self, path: str, query: dict[str, Any] | None = None) -> Any:
-        return self._request("GET", self.lock_url, path, query=query)
+    def get_lock(self, path: str, query: dict[str, Any] | None = None, timeout_s: int | None = None) -> Any:
+        return self._request("GET", self.lock_url, path, query=query, timeout_s=timeout_s)
 
-    def post_lock(self, path: str, payload: dict[str, Any] | None = None) -> Any:
-        return self._request("POST", self.lock_url, path, payload=payload or {})
+    def post_lock(self, path: str, payload: dict[str, Any] | None = None, timeout_s: int | None = None) -> Any:
+        return self._request("POST", self.lock_url, path, payload=payload or {}, timeout_s=timeout_s)
 
     def _request(
         self,
@@ -279,9 +287,14 @@ class KvmControlHttpClient:
         path: str,
         payload: dict[str, Any] | None = None,
         query: dict[str, Any] | None = None,
+        timeout_s: int | None = None,
     ) -> Any:
         url = f"{base_url.rstrip('/')}/{path.lstrip('/')}"
-        clean_query = {key: value for key, value in (query or {}).items() if value is not None}
+        clean_query = {
+            key: ("true" if value is True else "false" if value is False else value)
+            for key, value in (query or {}).items()
+            if value is not None
+        }
         if clean_query:
             url = f"{url}?{urlencode(clean_query)}"
         data = None if payload is None else json.dumps(payload).encode("utf-8")
@@ -298,14 +311,17 @@ class KvmControlHttpClient:
         if self.forwarded_for:
             headers["X-Forwarded-For"] = self.forwarded_for
         request = Request(url, data=data, headers=headers, method=method)
+        effective_timeout_s = timeout_s if timeout_s is not None else self.timeout_s
         try:
-            with urlopen(request, timeout=self.timeout_s) as response:
+            with urlopen(request, timeout=effective_timeout_s) as response:
                 body = response.read().decode("utf-8")
         except HTTPError as exc:
             detail = exc.read().decode("utf-8", errors="replace")
             raise RuntimeError(f"{method} {url} failed with HTTP {exc.code}: {detail}") from exc
         except URLError as exc:
             raise RuntimeError(f"{method} {url} failed: {exc.reason}") from exc
+        except TimeoutError as exc:
+            raise RuntimeError(f"{method} {url} timed out after {effective_timeout_s}s") from exc
         if not body:
             return None
         return json.loads(body)
@@ -413,6 +429,34 @@ def _mcp_context(client: KvmControlHttpClient) -> dict[str, Any]:
         return {"whoami": None, "environments": None, "allowed_zones": ["dev", "stage", "misc", "live"]}
 
 
+def _wait_ready_upstream_timeout(arguments: dict[str, Any]) -> int:
+    try:
+        requested_timeout_s = int(arguments.get("timeout_s", 120))
+    except (TypeError, ValueError):
+        requested_timeout_s = 120
+    return max(DEFAULT_UPSTREAM_TIMEOUT_S, requested_timeout_s + WAIT_READY_UPSTREAM_TIMEOUT_MARGIN_S)
+
+
+def _wait_for_operation(client: KvmControlHttpClient, operation_id: int, timeout_s: int, poll_interval_s: int) -> dict[str, Any]:
+    deadline = time.monotonic() + timeout_s
+    last_operation: dict[str, Any] | None = None
+    while True:
+        operation = client.get_control(f"/v1/operations/{operation_id}")
+        if isinstance(operation, dict):
+            last_operation = operation
+            if operation.get("status") in {"completed", "failed", "rejected"}:
+                operation["timed_out"] = False
+                return operation
+        now = time.monotonic()
+        if now >= deadline:
+            if last_operation is None:
+                last_operation = {"id": operation_id, "status": "unknown"}
+            last_operation = dict(last_operation)
+            last_operation["timed_out"] = True
+            return last_operation
+        time.sleep(min(poll_interval_s, max(0.0, deadline - now)))
+
+
 def _tools(context: dict[str, Any] | None = None) -> list[dict[str, Any]]:
     allowed_zones = (context or {}).get("allowed_zones") or ["dev", "stage", "misc", "live"]
     default_network = "dev" if "dev" in allowed_zones else allowed_zones[0]
@@ -518,6 +562,33 @@ def _tools(context: dict[str, Any] | None = None) -> list[dict[str, Any]]:
             "inputSchema": _vm_id_schema(),
         },
         {
+            "name": "get_operation",
+            "description": "Fetch an operation by id to inspect whether a previously started lifecycle action has completed.",
+            "inputSchema": {
+                "type": "object",
+                "required": ["operation_id"],
+                "properties": {"operation_id": {"type": "integer", "minimum": 1}},
+                "additionalProperties": False,
+            },
+        },
+        {
+            "name": "wait_for_operation",
+            "description": (
+                "Poll an operation until it reaches completed, failed, or rejected. Use after a deferred "
+                "delete when a test suite must wait for capacity or disk space to be physically reclaimed."
+            ),
+            "inputSchema": {
+                "type": "object",
+                "required": ["operation_id"],
+                "properties": {
+                    "operation_id": {"type": "integer", "minimum": 1},
+                    "timeout_s": {"type": "integer", "minimum": 0, "maximum": 900, "default": 120},
+                    "poll_interval_s": {"type": "integer", "minimum": 1, "maximum": 60, "default": 5},
+                },
+                "additionalProperties": False,
+            },
+        },
+        {
             "name": "wait_for_vm_ready",
             "description": (
                 "Ask kvm-control to wait until a VM is ready for normal access. The control API owns "
@@ -596,8 +667,21 @@ def _tools(context: dict[str, Any] | None = None) -> list[dict[str, Any]]:
         },
         {
             "name": "delete_vm",
-            "description": "Delete a VM and move its layer3 image to trash according to host policy.",
-            "inputSchema": _vm_id_schema(),
+            "description": (
+                "Delete a VM. With wait_for_completion=false, mark it for asynchronous cleanup and return "
+                "immediately; with wait_for_completion=true, wait until the VM has been stopped, its layer3 "
+                "image has been moved to trash, and registry cleanup has completed."
+            ),
+            "inputSchema": {
+                "type": "object",
+                "required": ["vm_id"],
+                "properties": {
+                    "vm_id": {"type": "string"},
+                    "wait_for_completion": {"type": "boolean", "default": True},
+                    "keep_layer2": {"type": "boolean", "default": True},
+                },
+                "additionalProperties": False,
+            },
         },
         {
             "name": "list_archived_vms",
@@ -989,26 +1073,36 @@ def _call_tool(client: KvmControlHttpClient, name: str | None, arguments: dict[s
         allowed_zones = context.get("allowed_zones") or ["dev"]
         payload.setdefault("network_id", "dev" if "dev" in allowed_zones else allowed_zones[0])
         payload.setdefault("autostart", True)
-        data = client.post_control("/v1/vms", payload)
+        data = client.post_control("/v1/vms", payload, timeout_s=LIFECYCLE_UPSTREAM_TIMEOUT_S)
         if isinstance(data, dict):
             data.setdefault("next_step", "call wait_for_vm_ready, then SSH to ssh_target when ready")
             data.setdefault("ssh_target", f"root@{data['reserved_ip']}" if data.get("reserved_ip") else None)
             if not payload.get("ssh_public_key"):
                 data.setdefault("warning", "ssh_public_key was omitted; SSH may fail unless the image already has a matching key")
     elif name == "start_vm":
-        data = client.post_control(f"/v1/vms/{arguments['vm_id']}/start")
+        data = client.post_control(f"/v1/vms/{arguments['vm_id']}/start", timeout_s=LIFECYCLE_UPSTREAM_TIMEOUT_S)
+    elif name == "get_operation":
+        data = client.get_control(f"/v1/operations/{arguments['operation_id']}")
+    elif name == "wait_for_operation":
+        data = _wait_for_operation(
+            client,
+            int(arguments["operation_id"]),
+            int(arguments.get("timeout_s", 120)),
+            int(arguments.get("poll_interval_s", 5)),
+        )
     elif name == "wait_for_vm_ready":
         payload = {key: arguments[key] for key in ("timeout_s", "poll_interval_s", "check_ssh") if key in arguments}
-        data = client.post_control(f"/v1/vms/{arguments['vm_id']}/wait-ready", payload)
+        data = client.post_control(f"/v1/vms/{arguments['vm_id']}/wait-ready", payload, timeout_s=_wait_ready_upstream_timeout(arguments))
     elif name == "stop_vm":
-        data = client.post_control(f"/v1/vms/{arguments['vm_id']}/stop")
+        data = client.post_control(f"/v1/vms/{arguments['vm_id']}/stop", timeout_s=LIFECYCLE_UPSTREAM_TIMEOUT_S)
     elif name == "promote_vm_layer2":
         payload = {key: arguments[key] for key in ("image_id", "description", "visible_name", "keywords") if key in arguments}
-        data = client.post_control(f"/v1/vms/{arguments['vm_id']}/promote-layer2", payload)
+        data = client.post_control(f"/v1/vms/{arguments['vm_id']}/promote-layer2", payload, timeout_s=IMAGE_LIFECYCLE_UPSTREAM_TIMEOUT_S)
     elif name == "resize_vm_layer3":
         data = client.post_control(
             f"/v1/vms/{arguments['vm_id']}/resize-layer3",
             {"new_size_mb": arguments["new_size_mb"]},
+            timeout_s=LIFECYCLE_UPSTREAM_TIMEOUT_S,
         )
     elif name == "set_vm_retention":
         data = client.post_control(
@@ -1016,7 +1110,14 @@ def _call_tool(client: KvmControlHttpClient, name: str | None, arguments: dict[s
             {"retention": arguments["retention"], "reason": arguments.get("reason")},
         )
     elif name == "delete_vm":
-        data = client.delete_control(f"/v1/vms/{arguments['vm_id']}")
+        data = client.delete_control(
+            f"/v1/vms/{arguments['vm_id']}",
+            query={
+                "wait": arguments.get("wait_for_completion", True),
+                "keep_layer2": arguments.get("keep_layer2", True),
+            },
+            timeout_s=LIFECYCLE_UPSTREAM_TIMEOUT_S,
+        )
     elif name == "list_archived_vms":
         data = client.get_control("/v1/archived-vms", query={"namespace": arguments.get("namespace")})
     elif name == "list_images":

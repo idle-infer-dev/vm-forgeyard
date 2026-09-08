@@ -18,6 +18,8 @@ REQUIRED_TOOLS = {
     "order_vm",
     "wait_for_vm_ready",
     "get_vm",
+    "get_operation",
+    "wait_for_operation",
     "stop_vm",
     "start_vm",
     "resize_vm_layer3",
@@ -105,6 +107,8 @@ def main() -> int:
         "non-interactive root SSH command",
         "SCP",
         "PUT /v1/webroot-artifacts/{namespace}/{path}",
+        "wait_for_completion=false",
+        "wait_for_operation",
         "refresh_lease",
     ):
         if phrase not in workflow_text:

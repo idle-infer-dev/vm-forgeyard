@@ -1104,7 +1104,10 @@ class Registry:
                 FROM vm_instances
                 WHERE retention = 'ephemeral'
                   AND layer3_presence = 'present'
-                  AND power_state IN ('stopped', 'failed')
+                  AND (
+                    power_state IN ('stopped', 'failed')
+                    OR status = 'deleting'
+                  )
                 ORDER BY namespace, vm_slot
                 """,
             ).fetchall()

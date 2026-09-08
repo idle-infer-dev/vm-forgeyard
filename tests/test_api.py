@@ -529,6 +529,53 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(archived.status_code, 200)
         self.assertTrue(any(item["vm_id"] == vm_id and item["namespace"] == "repo-a" for item in archived.json()))
 
+    def test_vm_delete_can_be_deferred_to_cleanup(self) -> None:
+        create = self.control.post(
+            "/v1/vms",
+            json={
+                "namespace": "repo-a",
+                "template_id": "ubuntu-24.04",
+                "vm_slot": "node-delete-deferred",
+            },
+        )
+        self.assertEqual(create.status_code, 202)
+        vm_id = create.json()["vm_id"]
+        layer3_path = Path(self.services.registry.get_vm(vm_id)["layer3_path"])
+
+        deferred = self.control.delete(f"/v1/vms/{vm_id}", params={"wait": "false"})
+        self.assertEqual(deferred.status_code, 202)
+        self.assertEqual(deferred.json()["action"], "delete")
+        self.assertEqual(deferred.json()["layer3_disposition"]["mode"], "deferred")
+        self.assertEqual(deferred.json()["layer3_disposition"]["layer3_path"], str(layer3_path))
+
+        marked = self.control.get(f"/v1/vms/{vm_id}")
+        self.assertEqual(marked.status_code, 200)
+        self.assertEqual(marked.json()["status"], "deleting")
+        self.assertEqual(marked.json()["power_state"], "running")
+        self.assertEqual(marked.json()["layer3_presence"], "present")
+
+        result = cleanup_stale_stopped_ephemeral_vms(self.services.config, self.services.registry, self.services.executor)
+        self.assertEqual([item["vm_id"] for item in result["cleaned"]], [vm_id])
+        self.assertEqual(result["cleaned"][0]["cleanup_reason"], "vm_delete_deferred")
+        self.assertIsNone(self.services.registry.get_vm(vm_id))
+        self.assertFalse(layer3_path.exists())
+
+    def test_deferred_delete_rejects_layer2_removal(self) -> None:
+        create = self.control.post(
+            "/v1/vms",
+            json={
+                "namespace": "repo-a",
+                "template_id": "ubuntu-24.04",
+                "vm_slot": "node-delete-deferred-layer2",
+            },
+        )
+        self.assertEqual(create.status_code, 202)
+        vm_id = create.json()["vm_id"]
+
+        deferred = self.control.delete(f"/v1/vms/{vm_id}", params={"wait": "false", "keep_layer2": "false"})
+        self.assertEqual(deferred.status_code, 422)
+        self.assertIn("keep_layer2=true", deferred.json()["detail"])
+
     def test_vm_create_fails_when_base_image_is_missing(self) -> None:
         missing_root = Path(self.tmp.name) / "missing-base"
         missing_root.mkdir(parents=True, exist_ok=True)
