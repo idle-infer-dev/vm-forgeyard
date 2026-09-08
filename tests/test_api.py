@@ -255,7 +255,7 @@ class ApiTests(unittest.TestCase):
                 "agent_label": "codex",
                 "handoff": "retain state if lifecycle test fails",
                 "ssh_public_key": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAITestKey codex-test",
-                "nested_virtualization": True,
+                "requested_capabilities": ["nested_kvm"],
             },
         )
         self.assertEqual(create.status_code, 202)
@@ -265,7 +265,13 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(create.json()["retention"], "keep_stopped")
         self.assertEqual(create.json()["purpose"], "exercise vm lifecycle")
         self.assertEqual(create.json()["agent_session_id"], "codex-test-session")
+        self.assertEqual(create.json()["requested_capabilities"], ["nested_kvm"])
+        self.assertEqual(create.json()["granted_capabilities"], ["nested_kvm"])
         self.assertTrue(create.json()["nested_virtualization"])
+        operation = self.control.get(f"/v1/operations/{create.json()['operation_id']}")
+        self.assertEqual(operation.status_code, 200)
+        self.assertEqual(operation.json()["details"]["requested_capabilities"], ["nested_kvm"])
+        self.assertEqual(operation.json()["details"]["granted_capabilities"], ["nested_kvm"])
         self.assertEqual(self.services.registry.get_vm(vm_id)["ssh_public_key"], "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAITestKey codex-test")
         self.assertEqual(self.services.registry.get_vm(vm_id)["nested_virtualization"], 1)
 
@@ -275,6 +281,8 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(vm.json()["readiness_state"], "booting")
         self.assertEqual(vm.json()["reserved_ip"], reserved_ip)
         self.assertEqual(vm.json()["retention"], "keep_stopped")
+        self.assertEqual(vm.json()["requested_capabilities"], ["nested_kvm"])
+        self.assertEqual(vm.json()["granted_capabilities"], ["nested_kvm"])
         self.assertTrue(vm.json()["nested_virtualization"])
 
         retention = self.control.post(
@@ -1788,7 +1796,7 @@ class ApiTests(unittest.TestCase):
                 "network_id": "dev",
                 "autostart": False,
                 "agent_session_id": "pytest-auth-session",
-                "nested_virtualization": True,
+                "requested_capabilities": ["nested_kvm"],
             },
             headers=repo_headers,
         )
@@ -1809,11 +1817,13 @@ class ApiTests(unittest.TestCase):
                 "vm_slot": "nested-allowed",
                 "network_id": "dev",
                 "agent_session_id": "pytest-auth-session",
-                "nested_virtualization": True,
+                "requested_capabilities": ["nested_kvm"],
             },
             headers=kvm_control_headers,
         )
         self.assertEqual(nested_allowed.status_code, 202)
+        self.assertEqual(nested_allowed.json()["requested_capabilities"], ["nested_kvm"])
+        self.assertEqual(nested_allowed.json()["granted_capabilities"], ["nested_kvm"])
         self.assertTrue(nested_allowed.json()["nested_virtualization"])
 
         config["host"]["nested_virtualization_enabled"] = False
@@ -1829,7 +1839,7 @@ class ApiTests(unittest.TestCase):
                     "network_id": "dev",
                     "autostart": False,
                     "agent_session_id": "pytest-auth-session",
-                    "nested_virtualization": True,
+                    "requested_capabilities": ["nested_kvm"],
                 },
                 headers=kvm_control_headers,
             )
@@ -1845,7 +1855,7 @@ class ApiTests(unittest.TestCase):
                 "vm_slot": "nested-limited",
                 "network_id": "dev",
                 "agent_session_id": "pytest-auth-session",
-                "nested_virtualization": True,
+                "requested_capabilities": ["nested_kvm"],
             },
             headers=kvm_control_headers,
         )
@@ -1861,7 +1871,7 @@ class ApiTests(unittest.TestCase):
                 "vm_slot": "nested-after-stop",
                 "network_id": "dev",
                 "agent_session_id": "pytest-auth-session",
-                "nested_virtualization": True,
+                "requested_capabilities": ["nested_kvm"],
             },
             headers=kvm_control_headers,
         )
@@ -2726,7 +2736,12 @@ class ApiTests(unittest.TestCase):
     def test_status_snapshot_groups_vms_and_locks(self) -> None:
         create_a = self.control.post(
             "/v1/vms",
-            json={"namespace": "repo-a", "template_id": "ubuntu-24.04", "vm_slot": "node1"},
+            json={
+                "namespace": "repo-a",
+                "template_id": "ubuntu-24.04",
+                "vm_slot": "node1",
+                "requested_capabilities": ["nested_kvm"],
+            },
         )
         self.assertEqual(create_a.status_code, 202)
         create_b = self.control.post(
@@ -2747,6 +2762,8 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(repo_a_vm["base_image"], "ubuntu-24.04-base.qcow2")
         self.assertEqual(repo_a_vm["layer2_presence"], "present")
         self.assertEqual(repo_a_vm["layer3_presence"], "present")
+        self.assertEqual(repo_a_vm["requested_capabilities"], ["nested_kvm"])
+        self.assertEqual(repo_a_vm["granted_capabilities"], ["nested_kvm"])
 
         namespaces = {item["namespace"]: item for item in payload["namespaces"]}
         self.assertEqual(namespaces["repo-a"]["granted_lock_count"], 1)

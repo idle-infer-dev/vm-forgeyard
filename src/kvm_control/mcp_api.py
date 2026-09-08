@@ -455,7 +455,8 @@ def _tools(context: dict[str, Any] | None = None) -> list[dict[str, Any]]:
                 "accepts that agent's SSH key; otherwise access depends on host-default keys already "
                 "present in the image and may fail. Use layer3_size_mb when a test needs a larger root disk virtual "
                 "size from first boot. agent_session_id is required so the VM can be traced "
-                "back to the requesting agent session. nested_virtualization is restricted to privileged callers. "
+                "back to the requesting agent session. requested_capabilities can include nested_kvm for privileged "
+                "callers; nested_virtualization remains a backwards-compatible boolean for the same capability. "
                 "By default the VM is started immediately. "
                 "After ordering, call wait_for_vm_ready before using SSH."
             ),
@@ -479,6 +480,11 @@ def _tools(context: dict[str, Any] | None = None) -> list[dict[str, Any]]:
                     "agent_session_id": {"type": "string"},
                     "agent_label": {"type": "string"},
                     "handoff": {"type": "string"},
+                    "requested_capabilities": {
+                        "type": "array",
+                        "items": {"type": "string", "enum": ["nested_kvm"]},
+                        "uniqueItems": True,
+                    },
                     "nested_virtualization": {"type": "boolean", "default": False},
                     "ssh_public_key": {
                         "type": "string",

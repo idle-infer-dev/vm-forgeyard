@@ -27,6 +27,7 @@ FirewallTargetZone = Literal["net", "dev", "stage", "misc", "live"]
 EndpointWorkaroundKind = Literal["fqdn", "ip"]
 EndpointWorkaroundType = Literal["hosts_entry", "dnat"]
 AuthRole = Literal["admin", "dev", "staging", "live", "repository"]
+VmCapability = Literal["nested_kvm"]
 
 
 class CreateVmRequest(BaseModel):
@@ -48,6 +49,7 @@ class CreateVmRequest(BaseModel):
     agent_label: str | None = Field(default=None, pattern=r"^[A-Za-z0-9._:-]+$")
     handoff: str | None = None
     ssh_public_key: str | None = Field(default=None, max_length=4096)
+    requested_capabilities: list[VmCapability] = Field(default_factory=list)
     nested_virtualization: bool = False
 
 
@@ -104,6 +106,8 @@ class VmActionResponse(BaseModel):
     agent_session_id: str | None = None
     agent_label: str | None = None
     handoff: str | None = None
+    requested_capabilities: list[VmCapability] = Field(default_factory=list)
+    granted_capabilities: list[VmCapability] = Field(default_factory=list)
     nested_virtualization: bool = False
 
 

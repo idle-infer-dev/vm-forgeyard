@@ -87,6 +87,7 @@ def build_status_snapshot(services: Services) -> dict[str, Any]:
     for vm in vms:
         template = templates.get(vm["template_id"], {})
         namespace = vm["namespace"]
+        capabilities = ["nested_kvm"] if bool(vm.get("nested_virtualization")) else []
         vm_view = {
             "vm_id": vm["vm_id"],
             "namespace": namespace,
@@ -99,6 +100,9 @@ def build_status_snapshot(services: Services) -> dict[str, Any]:
             "pause_reason": vm.get("pause_reason"),
             "vcpus": vm["vcpus"],
             "memory_mb": vm["memory_mb"],
+            "requested_capabilities": capabilities,
+            "granted_capabilities": capabilities,
+            "nested_virtualization": bool(vm.get("nested_virtualization")),
             "reserved_ip": vm["reserved_ip"],
             "reserved_mac": vm["reserved_mac"],
             "layer2_path": vm["layer2_path"],

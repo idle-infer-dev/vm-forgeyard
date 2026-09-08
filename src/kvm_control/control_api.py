@@ -395,6 +395,22 @@ def create_app(services: Services | None = None) -> FastAPI:
                 }
         return None
 
+    def _vm_capabilities(vm: dict) -> list[str]:
+        return ["nested_kvm"] if bool(vm.get("nested_virtualization")) else []
+
+    def _vm_api_view(vm: dict) -> dict:
+        view = dict(vm)
+        capabilities = _vm_capabilities(vm)
+        view["requested_capabilities"] = capabilities
+        view["granted_capabilities"] = capabilities
+        return view
+
+    def _requested_capabilities(payload: CreateVmRequest) -> list[str]:
+        capabilities = list(dict.fromkeys(payload.requested_capabilities))
+        if payload.nested_virtualization and "nested_kvm" not in capabilities:
+            capabilities.append("nested_kvm")
+        return capabilities
+
     def response_for(
         vm: dict,
         operation_id: int,
@@ -425,6 +441,8 @@ def create_app(services: Services | None = None) -> FastAPI:
             agent_session_id=vm.get("agent_session_id"),
             agent_label=vm.get("agent_label"),
             handoff=vm.get("handoff"),
+            requested_capabilities=_vm_capabilities(vm),
+            granted_capabilities=_vm_capabilities(vm),
             nested_virtualization=bool(vm.get("nested_virtualization")),
         )
 
@@ -1698,7 +1716,7 @@ def create_app(services: Services | None = None) -> FastAPI:
         if principal.namespace is not None:
             vms = [vm for vm in vms if vm["namespace"] == principal.namespace]
         vms = [vm for vm in vms if vm["network_id"] in principal.allowed_zones]
-        return [_sync_vm_runtime_state(vm) for vm in vms]
+        return [_vm_api_view(_sync_vm_runtime_state(vm)) for vm in vms]
 
     @api.get("/v1/archived-vms")
     def list_archived_vms(namespace: str | None = None, principal: AuthPrincipal = Depends(current_principal)) -> list[dict]:
@@ -1712,7 +1730,7 @@ def create_app(services: Services | None = None) -> FastAPI:
     def get_vm(vm_id: str, principal: AuthPrincipal = Depends(current_principal)) -> dict:
         vm = _load_vm(vm_id)
         _require_vm_access(vm, principal)
-        return _sync_vm_runtime_state(vm)
+        return _vm_api_view(_sync_vm_runtime_state(vm))
 
     @api.get("/v1/namespaces/{namespace}/disk-usage")
     def namespace_disk_usage(namespace: str, principal: AuthPrincipal = Depends(current_principal)) -> dict:
@@ -1868,8 +1886,10 @@ def create_app(services: Services | None = None) -> FastAPI:
             payload.network_id = default_zone(principal)
         require_zone(principal, payload.network_id)
         retention = _default_retention(payload)
+        requested_capabilities = _requested_capabilities(payload)
+        requested_nested_virtualization = "nested_kvm" in requested_capabilities
         _validate_retention(retention, principal)
-        _validate_nested_virtualization(payload.nested_virtualization, principal)
+        _validate_nested_virtualization(requested_nested_virtualization, principal)
         ssh_public_key = _validate_ssh_public_key(payload.ssh_public_key)
         template = templates.get(payload.template_id)
         if template is None:
@@ -1936,7 +1956,7 @@ def create_app(services: Services | None = None) -> FastAPI:
             )
             raise HTTPException(status_code=422, detail={"operation_id": operation_id, "reason": reason})
 
-        if payload.nested_virtualization:
+        if requested_nested_virtualization:
             active_nested = services.registry.active_nested_virtualization_count(payload.namespace)
             nested_limit = services.config.host.max_nested_virtualization_vms_per_namespace
             if active_nested >= nested_limit:
@@ -1985,7 +2005,11 @@ def create_app(services: Services | None = None) -> FastAPI:
             vm_id=vm_id,
             namespace=payload.namespace,
             status="running",
-            details={"autostart": payload.autostart},
+            details={
+                "autostart": payload.autostart,
+                "requested_capabilities": requested_capabilities,
+                "granted_capabilities": requested_capabilities,
+            },
         )
 
         vm = services.registry.upsert_vm(
@@ -2017,7 +2041,7 @@ def create_app(services: Services | None = None) -> FastAPI:
                 "agent_label": payload.agent_label,
                 "handoff": payload.handoff,
                 "ssh_public_key": ssh_public_key,
-                "nested_virtualization": int(payload.nested_virtualization),
+                "nested_virtualization": int(requested_nested_virtualization),
             }
         )
 

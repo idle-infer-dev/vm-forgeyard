@@ -171,10 +171,13 @@ class McpApiTests(unittest.TestCase):
         self.assertIn("purpose", order_vm["inputSchema"]["properties"])
         self.assertIn("agent_session_id", order_vm["inputSchema"]["properties"])
         self.assertIn("ssh_public_key", order_vm["inputSchema"]["properties"])
+        self.assertIn("requested_capabilities", order_vm["inputSchema"]["properties"])
+        self.assertEqual(order_vm["inputSchema"]["properties"]["requested_capabilities"]["items"]["enum"], ["nested_kvm"])
         self.assertIn("nested_virtualization", order_vm["inputSchema"]["properties"])
         self.assertIn("agent_session_id", order_vm["inputSchema"]["required"])
         self.assertIn("agent_session_id is required", order_vm["description"])
         self.assertIn("ssh_public_key", order_vm["description"])
+        self.assertIn("requested_capabilities", order_vm["description"])
         self.assertIn("nested_virtualization", order_vm["description"])
         self.assertIn("reserved_ip", order_vm["description"])
         self.assertIn("root@reserved_ip", order_vm["description"])
@@ -231,7 +234,7 @@ class McpApiTests(unittest.TestCase):
                     "layer3_size_mb": 4096,
                     "agent_session_id": "pytest-mcp-session",
                     "ssh_public_key": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAITestKey pytest-agent",
-                    "nested_virtualization": True,
+                    "requested_capabilities": ["nested_kvm"],
                 },
             },
         )
@@ -241,7 +244,7 @@ class McpApiTests(unittest.TestCase):
         self.assertEqual(payload["layer3_size_mb"], 4096)
         self.assertEqual(payload["agent_session_id"], "pytest-mcp-session")
         self.assertEqual(payload["ssh_public_key"], "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAITestKey pytest-agent")
-        self.assertTrue(payload["nested_virtualization"])
+        self.assertEqual(payload["requested_capabilities"], ["nested_kvm"])
         self.assertEqual(result["result"]["structuredContent"]["ssh_target"], "root@10.80.1.23")
         self.assertIn("wait_for_vm_ready", result["result"]["structuredContent"]["next_step"])
         self.assertIn(("post_control", "/v1/vms", payload), self.fake.calls)
