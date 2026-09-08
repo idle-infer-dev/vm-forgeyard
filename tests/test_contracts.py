@@ -4,6 +4,7 @@ import json
 import subprocess
 import sys
 import tempfile
+import tomllib
 import unittest
 from pathlib import Path
 
@@ -213,3 +214,19 @@ class ContractValidationTests(unittest.TestCase):
         self.assertIn("private 10.7.x address", completed.stderr)
         self.assertIn("local developer path", completed.stderr)
         self.assertIn("literal bearer token", completed.stderr)
+
+    def test_public_release_metadata_exists(self) -> None:
+        root = Path(__file__).resolve().parents[1]
+        expected_files = ["LICENSE", "CONTRIBUTING.md", "SECURITY.md", "RELEASE.md"]
+        for filename in expected_files:
+            self.assertTrue((root / filename).exists(), filename)
+
+        readme = (root / "README.md").read_text()
+        for filename in expected_files:
+            self.assertIn(filename, readme)
+
+        pyproject = tomllib.loads((root / "pyproject.toml").read_text())
+        self.assertEqual(pyproject["project"]["name"], "vm-forgeyard")
+        self.assertEqual(pyproject["project"]["license"]["text"], "GPL-2.0-only")
+        self.assertEqual(pyproject["project"]["urls"]["Repository"], "https://github.com/idle-infer-dev/vm-forgeyard")
+        self.assertEqual(pyproject["project"]["urls"]["Issues"], "https://github.com/idle-infer-dev/vm-forgeyard/issues")

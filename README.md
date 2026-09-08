@@ -122,6 +122,13 @@ Deployment automation is intentionally not included yet. Ansible roles should be
 published only after their defaults and examples are generalized enough to be
 useful outside one infrastructure environment.
 
+## Project Metadata
+
+- [Contributing](./CONTRIBUTING.md)
+- [Security policy](./SECURITY.md)
+- [Release checklist](./RELEASE.md)
+- [License](./LICENSE)
+
 ## License
 
 vm-forgeyard is licensed under the GNU General Public License version 2.0.
