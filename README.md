@@ -104,6 +104,7 @@ PYTHONPATH=src python scripts/sandbox_api_smoke.py
 PYTHONPATH=src python scripts/check_api_dry_run.py
 PYTHONPATH=src python scripts/check_browser_mobile_layer2_dry_run.py
 PYTHONPATH=src python scripts/check_contracts.py
+PYTHONPATH=src python scripts/check_public_hygiene.py
 ```
 
 Check an MCP endpoint:

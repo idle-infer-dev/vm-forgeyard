@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import subprocess
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -168,3 +169,47 @@ class ContractValidationTests(unittest.TestCase):
         markdown = render_markdown_report(draft)
         self.assertIn("Classification: `documentation_gap`", markdown)
         self.assertIn("Preconditions To Verify", markdown)
+
+    def test_public_hygiene_script_accepts_clean_public_tree(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "tests").mkdir()
+            (root / "tests" / "test_auth.py").write_text('headers = {"Authorization": "Bearer admin-secret"}\n')
+            completed = subprocess.run(
+                [sys.executable, "scripts/check_public_hygiene.py", str(root)],
+                check=True,
+                cwd=Path(__file__).resolve().parents[1],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+        self.assertIn("public hygiene check passed", completed.stdout)
+
+    def test_public_hygiene_script_rejects_private_leaks(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "README.md").write_text(
+                "\n".join(
+                    [
+                        "host " + "kvm" + "0",
+                        "api " + "10." + "7.31.41:8000",
+                        "path " + "/home/" + "sven/git/kvm-control",
+                        "token " + "TR" + "m49",
+                        "file " + "admin-" + "token",
+                        "header Authorization: Bearer " + "A" * 24,
+                    ]
+                )
+            )
+            completed = subprocess.run(
+                [sys.executable, "scripts/check_public_hygiene.py", str(root)],
+                check=False,
+                cwd=Path(__file__).resolve().parents[1],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+        self.assertNotEqual(completed.returncode, 0)
+        self.assertIn("private KVM host name", completed.stderr)
+        self.assertIn("private 10.7.x address", completed.stderr)
+        self.assertIn("local developer path", completed.stderr)
+        self.assertIn("literal bearer token", completed.stderr)
