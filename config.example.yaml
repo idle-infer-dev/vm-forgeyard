@@ -5,6 +5,7 @@ host:
   max_total_memory_mb: 32768
   max_layer3_per_layer2: 6
   nested_virtualization_enabled: false
+  max_nested_virtualization_vms_per_namespace: 1
 network:
   cidr: 10.80.0.0/20
   gateway: 10.80.0.1

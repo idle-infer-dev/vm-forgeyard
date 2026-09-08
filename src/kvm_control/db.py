@@ -1275,6 +1275,20 @@ class Registry:
             return False, "memory_limit_reached"
         return True, None
 
+    def active_nested_virtualization_count(self, namespace: str) -> int:
+        with self.tx() as conn:
+            row = conn.execute(
+                """
+                SELECT COUNT(*) AS count
+                FROM vm_instances
+                WHERE namespace = ?
+                  AND nested_virtualization = 1
+                  AND power_state IN ('starting', 'running')
+                """,
+                (namespace,),
+            ).fetchone()
+        return int(row["count"])
+
     def namespace_disk_usage(self, namespace: str) -> dict[str, Any]:
         rows = self.list_vms_for_namespace(namespace)
         layer2_paths = {row["layer2_path"] for row in rows if row["layer2_presence"] == "present"}

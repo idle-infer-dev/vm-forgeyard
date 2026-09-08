@@ -19,6 +19,7 @@ class HostConfig(BaseModel):
     max_total_memory_mb: int = 32768
     max_layer3_per_layer2: int = 6
     nested_virtualization_enabled: bool = False
+    max_nested_virtualization_vms_per_namespace: int = 1
 
 
 class NetworkSegmentConfig(BaseModel):

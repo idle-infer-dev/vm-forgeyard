@@ -1936,6 +1936,24 @@ def create_app(services: Services | None = None) -> FastAPI:
             )
             raise HTTPException(status_code=422, detail={"operation_id": operation_id, "reason": reason})
 
+        if payload.nested_virtualization:
+            active_nested = services.registry.active_nested_virtualization_count(payload.namespace)
+            nested_limit = services.config.host.max_nested_virtualization_vms_per_namespace
+            if active_nested >= nested_limit:
+                operation_id = services.registry.create_operation(
+                    action="create",
+                    vm_id=None,
+                    namespace=payload.namespace,
+                    status="rejected",
+                    rejection_category="policy",
+                    rejection_reason="nested virtualization namespace limit reached",
+                    details={"active_nested_virtualization_vms": active_nested, "limit": nested_limit},
+                )
+                raise HTTPException(
+                    status_code=422,
+                    detail={"operation_id": operation_id, "reason": "nested virtualization namespace limit reached"},
+                )
+
         if services.registry.active_layer3_count(payload.namespace, payload.template_id) >= services.config.host.max_layer3_per_layer2:
             operation_id = services.registry.create_operation(
                 action="create",

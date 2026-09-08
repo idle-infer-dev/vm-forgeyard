@@ -1808,7 +1808,6 @@ class ApiTests(unittest.TestCase):
                 "template_id": "ubuntu-24.04",
                 "vm_slot": "nested-allowed",
                 "network_id": "dev",
-                "autostart": False,
                 "agent_session_id": "pytest-auth-session",
                 "nested_virtualization": True,
             },
@@ -1838,6 +1837,36 @@ class ApiTests(unittest.TestCase):
             self.assertEqual(host_denied.json()["detail"], "nested virtualization is not enabled on this host")
         finally:
             disabled_services.monitor.stop()
+
+        nested_limited = self.control.post(
+            "/v1/vms",
+            json={
+                "template_id": "ubuntu-24.04",
+                "vm_slot": "nested-limited",
+                "network_id": "dev",
+                "agent_session_id": "pytest-auth-session",
+                "nested_virtualization": True,
+            },
+            headers=kvm_control_headers,
+        )
+        self.assertEqual(nested_limited.status_code, 422)
+        self.assertEqual(nested_limited.json()["detail"]["reason"], "nested virtualization namespace limit reached")
+
+        stop_nested = self.control.post(f"/v1/vms/{nested_allowed.json()['vm_id']}/stop", headers=kvm_control_headers)
+        self.assertEqual(stop_nested.status_code, 202)
+        nested_after_stop = self.control.post(
+            "/v1/vms",
+            json={
+                "template_id": "ubuntu-24.04",
+                "vm_slot": "nested-after-stop",
+                "network_id": "dev",
+                "agent_session_id": "pytest-auth-session",
+                "nested_virtualization": True,
+            },
+            headers=kvm_control_headers,
+        )
+        self.assertEqual(nested_after_stop.status_code, 202)
+        self.assertTrue(nested_after_stop.json()["nested_virtualization"])
 
         dev_vm = self.control.post(
             "/v1/vms",
