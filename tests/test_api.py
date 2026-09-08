@@ -541,9 +541,12 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(create.status_code, 202)
         vm_id = create.json()["vm_id"]
         layer3_path = Path(self.services.registry.get_vm(vm_id)["layer3_path"])
+        self.services.monitor.stop()
 
-        deferred = self.control.delete(f"/v1/vms/{vm_id}", params={"wait": "false"})
+        with patch.object(self.services.monitor, "request_stale_ephemeral_cleanup", wraps=self.services.monitor.request_stale_ephemeral_cleanup) as request_cleanup:
+            deferred = self.control.delete(f"/v1/vms/{vm_id}", params={"wait": "false"})
         self.assertEqual(deferred.status_code, 202)
+        request_cleanup.assert_called_once_with()
         self.assertEqual(deferred.json()["action"], "delete")
         self.assertEqual(deferred.json()["layer3_disposition"]["mode"], "deferred")
         self.assertEqual(deferred.json()["layer3_disposition"]["layer3_path"], str(layer3_path))
@@ -2583,6 +2586,68 @@ class ApiTests(unittest.TestCase):
         self.services.monitor.sample_all_runs()
         self.assertIsNone(self.services.registry.get_vm("repo-monitor-cleanup-stale"))
         self.assertFalse(layer3.exists())
+
+    def test_deferred_vm_cleanup_forces_poweroff_when_graceful_stop_fails(self) -> None:
+        create = self.control.post(
+            "/v1/vms",
+            json={
+                "namespace": "repo-cleanup-force",
+                "template_id": "ubuntu-24.04",
+                "vm_slot": "node",
+            },
+        )
+        self.assertEqual(create.status_code, 202)
+        vm_id = create.json()["vm_id"]
+        layer3_path = Path(self.services.registry.get_vm(vm_id)["layer3_path"])
+        self.services.monitor.stop()
+        deferred = self.control.delete(f"/v1/vms/{vm_id}", params={"wait": "false"})
+        self.assertEqual(deferred.status_code, 202)
+        actions: list[str] = []
+        original_run = self.services.executor.run
+
+        def run_with_failed_graceful_stop(action: str, payload: dict) -> dict:
+            actions.append(action)
+            if action == "stop-vm":
+                raise RuntimeError("guest ignored graceful shutdown")
+            return original_run(action, payload)
+
+        with patch.object(self.services.executor, "run", side_effect=run_with_failed_graceful_stop):
+            result = cleanup_stale_stopped_ephemeral_vms(self.services.config, self.services.registry, self.services.executor)
+
+        self.assertEqual([item["vm_id"] for item in result["cleaned"]], [vm_id])
+        self.assertIn("poweroff-vm", actions)
+        self.assertIsNone(self.services.registry.get_vm(vm_id))
+        self.assertFalse(layer3_path.exists())
+
+    def test_blocking_vm_delete_forces_poweroff_when_graceful_stop_fails(self) -> None:
+        create = self.control.post(
+            "/v1/vms",
+            json={
+                "namespace": "repo-delete-force",
+                "template_id": "ubuntu-24.04",
+                "vm_slot": "node",
+            },
+        )
+        self.assertEqual(create.status_code, 202)
+        vm_id = create.json()["vm_id"]
+        layer3_path = Path(self.services.registry.get_vm(vm_id)["layer3_path"])
+        actions: list[str] = []
+        original_run = self.services.executor.run
+
+        def run_with_failed_graceful_stop(action: str, payload: dict) -> dict:
+            actions.append(action)
+            if action == "stop-vm":
+                raise RuntimeError("guest ignored graceful shutdown")
+            return original_run(action, payload)
+
+        with patch.object(self.services.executor, "run", side_effect=run_with_failed_graceful_stop):
+            deleted = self.control.delete(f"/v1/vms/{vm_id}")
+
+        self.assertEqual(deleted.status_code, 202)
+        self.assertEqual(deleted.json()["status"], "completed")
+        self.assertIn("poweroff-vm", actions)
+        self.assertIsNone(self.services.registry.get_vm(vm_id))
+        self.assertFalse(layer3_path.exists())
 
     def test_monitor_runs_stale_trash_cleanup(self) -> None:
         self.services.config.cleanup.trash_file_ttl_seconds = 86400

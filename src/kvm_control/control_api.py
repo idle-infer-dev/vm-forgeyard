@@ -86,6 +86,7 @@ from .models import (
 )
 from .service import Services, build_services
 from .status_api import create_status_router, status_assets_dir
+from .vm_cleanup import stop_vm_for_cleanup
 
 
 MAX_WEBROOT_ARTIFACT_BYTES = 32 * 1024 * 1024
@@ -2613,6 +2614,7 @@ def create_app(services: Services | None = None) -> FastAPI:
                 "completed",
                 details={"keep_layer2": keep_layer2, "cleanup_reason": "vm_delete_deferred", "completion_deferred": True},
             )
+            services.monitor.request_stale_ephemeral_cleanup()
             layer3_path = Path(vm["layer3_path"])
             return response_for(
                 updated,
@@ -2631,10 +2633,7 @@ def create_app(services: Services | None = None) -> FastAPI:
         operation_id = services.registry.create_operation("delete", vm_id, vm["namespace"], "running")
         executor_results: list[dict] = []
         try:
-            executor_results.append(services.executor.run(
-                "stop-vm",
-                _vm_executor_payload(vm, operation_id),
-            ))
+            executor_results.append(stop_vm_for_cleanup(services.executor, vm, operation_id, enforce_poweroff=True))
             executor_results.append(services.executor.run(
                 "delete-layer3",
                 {

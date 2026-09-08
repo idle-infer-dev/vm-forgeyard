@@ -34,6 +34,24 @@ def _stopped_reference_time(vm: dict[str, Any]) -> datetime | None:
     return _parse_db_timestamp(vm.get("updated_at")) or _parse_db_timestamp(vm.get("created_at"))
 
 
+def stop_vm_for_cleanup(executor: ExecutorClient, vm: dict[str, Any], operation_id: int, *, enforce_poweroff: bool) -> dict[str, Any]:
+    payload = {
+        "operation_id": operation_id,
+        "namespace": vm["namespace"],
+        "vm_id": vm["vm_id"],
+        "layer2_path": vm["layer2_path"],
+        "layer3_path": vm["layer3_path"],
+    }
+    try:
+        return executor.run("stop-vm", payload)
+    except Exception as exc:
+        if not enforce_poweroff:
+            raise
+        result = executor.run("poweroff-vm", payload)
+        result["forced_after_stop_error"] = str(exc)
+        return result
+
+
 def cleanup_stale_stopped_ephemeral_vms(config: AppConfig, registry: Registry, executor: ExecutorClient) -> dict[str, Any]:
     ttl_seconds = config.cleanup.stopped_ephemeral_vm_ttl_seconds
     now = datetime.now(UTC)
@@ -60,15 +78,7 @@ def cleanup_stale_stopped_ephemeral_vms(config: AppConfig, registry: Registry, e
             details={"stopped_reference_at": vm["stopped_reference_at"], "ttl_seconds": ttl_seconds, "cleanup_reason": vm["cleanup_reason"]},
         )
         try:
-            executor.run(
-                "stop-vm",
-                {
-                    "namespace": vm["namespace"],
-                    "vm_id": vm_id,
-                    "layer2_path": vm["layer2_path"],
-                    "layer3_path": vm["layer3_path"],
-                },
-            )
+            stop_vm_for_cleanup(executor, vm, operation_id, enforce_poweroff=vm["cleanup_reason"] == "vm_delete_deferred")
             layer3_delete_result = executor.run(
                 "delete-layer3",
                 {

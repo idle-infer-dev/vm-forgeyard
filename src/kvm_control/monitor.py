@@ -45,6 +45,9 @@ class RunMonitor:
         if thread is not None:
             thread.join(timeout=max(1.0, self.interval_s + 0.5))
 
+    def request_stale_ephemeral_cleanup(self) -> None:
+        self._last_stale_ephemeral_cleanup_at = 0.0
+
     def _run(self) -> None:
         while not self._stop_event.is_set():
             try:
